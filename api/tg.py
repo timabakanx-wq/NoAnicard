@@ -5,13 +5,12 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler
 
-# 1. ИСПРАВЛЕНО: file -> __file__
+# ИСПРАВЛЕНО: file -> __file__
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.methods import TelegramMethod
 from aiogram.types import Update
 
 import bot_app
@@ -19,7 +18,7 @@ import bot_app
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 logging.basicConfig(level=logging.INFO)
 
-# 2. Безопасный Event Loop для Serverless (избегаем ошибок при warm start)
+# Безопасный Event Loop для Serverless
 try:
     _loop = asyncio.get_event_loop()
 except RuntimeError:
@@ -32,12 +31,9 @@ _dp: Dispatcher | None = None
 async def _ensure_ready():
     global _bot, _dp
     if _bot is None:
-        await bot_app.db_init()                       # aiohttp-сессия Supabase
-        
-        # 3. Проверка токена и явная передача token=
         if not bot_app.BOT_TOKEN:
             raise ValueError("BOT_TOKEN is not set in Vercel Environment Variables!")
-            
+        await bot_app.db_init()
         _bot = Bot(token=bot_app.BOT_TOKEN,
                    default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         _dp = Dispatcher()
@@ -47,9 +43,8 @@ async def _ensure_ready():
 async def _process(body: bytes):
     bot, dp = await _ensure_ready()
     update = Update(**json.loads(body))
-    result = await dp.feed_update(bot, update)
-    if isinstance(result, TelegramMethod):
-        await bot(result)
+    # feed_update сам выполнит все хендлеры и дождется await'ов внутри них
+    await dp.feed_update(bot, update)
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -60,19 +55,25 @@ class handler(BaseHTTPRequestHandler):
         if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
             self.send_response(403)
             self.end_headers()
+            self.wfile.write(b"forbidden")
             return
             
         try:
             _loop.run_until_complete(_process(body))
+            # ВАЖНО: Корректное закрытие HTTP-ответа
             self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-        except Exception:
+            self.wfile.write(b"ok")
+        except Exception as e:
             logging.exception("webhook processing error")
             self.send_response(500)
             self.end_headers()
+            self.wfile.write(b"error")
 
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"card-battle-bot webhook is up")
 
