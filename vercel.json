@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/tg.py", "use": "@vercel/python" }
+  ],
+  "routes": [
+    { "src": "/tg", "dest": "api/tg.py" },
+    { "src": "/", "dest": "api/tg.py" }
+  ],
+  "functions": {
+    "api/tg.py": { "maxDuration": 30 }
+  }
+}
