@@ -1,13 +1,16 @@
 {
   "version": 2,
-  "regions": ["fra1"],
-  "builds": [],
+  "regions": [
+    "fra1"
+  ],
   "routes": [
     { "src": "/tg", "dest": "api/tg.py" },
     { "src": "/diag", "dest": "api/tg.py" },
     { "src": "/.*", "dest": "api/tg.py" }
   ],
   "functions": {
-    "api/tg.py": { "maxDuration": 60 }
+    "api/tg.py": {
+      "maxDuration": 60
+    }
   }
 }
