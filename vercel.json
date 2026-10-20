@@ -1,12 +1,15 @@
 {
   "version": 2,
+  "regions": ["fra1"],
+  "builds": [
+    { "src": "api/tg.py", "use": "@vercel/python" }
+  ],
   "routes": [
     { "src": "/tg", "dest": "api/tg.py" },
-    { "src": "/", "dest": "api/tg.py" }
+    { "src": "/diag", "dest": "api/tg.py" },
+    { "src": "/.*", "dest": "api/tg.py" }
   ],
   "functions": {
-    "api/tg.py": {
-      "maxDuration": 30
-    }
+    "api/tg.py": { "maxDuration": 60 }
   }
 }
