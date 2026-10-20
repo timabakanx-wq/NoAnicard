@@ -2626,7 +2626,7 @@ async def ensure_access_msg(m: Message) -> bool:
 async def cb_access_middleware(handler, event: CallbackQuery, data):
     # Тот же страж, но для нажатий на инлайн-кнопки
     if not await has_access(event.from_user.id):
-        await event.answer("🔒 Доступ к боту защищён паролем.\nОтправьте /start и введите пароль.",
+        await safe_answer(event, "🔒 Доступ к боту защищён паролем.\nОтправьте /start и введите пароль.",
                            show_alert=True)
         return
     return await handler(event, data)
@@ -2744,8 +2744,25 @@ async def msg_catchall(m: Message):
 
 @router.callback_query(F.data == "mn:home")
 async def cb_home(call: CallbackQuery):
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, MENU_TEXT, None)
+
+
+async def safe_answer(call, text=None, show_alert=False, cache_time=None):
+    # answerCallbackQuery падает с «query is too old and response timeout
+    # expired or query ID is invalid», если с момента нажатия кнопки прошло
+    # ~10-15 секунд. Так бывает, когда Telegram повторно доставляет апдейт
+    # после медленной или упавшей первой обработки (cold start, долгий бой,
+    # прогон симуляций). Это НЕ повод ронять весь апдейт и пугать
+    # пользователя «⚠️ Внутренняя ошибка бота»: молча глотаем именно эту
+    # ошибку — хендлер доработает и обновит экран через safe_edit.
+    try:
+        await call.answer(text, show_alert=show_alert, cache_time=cache_time)
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "query is too old" in msg or "query id is invalid" in msg:
+            return
+        raise
 
 
 async def safe_edit(call: CallbackQuery, text: str, markup=None):
@@ -2923,7 +2940,7 @@ async def battle_deck_screen(user_id: int):
 async def cb_collection(call: CallbackQuery):
     _, f, page = call.data.split(":")
     text, markup = await collection_screen(call.from_user.id, f, int(page))
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, markup)
 
 
@@ -2934,7 +2951,7 @@ async def cb_collection_races(call: CallbackQuery):
     for i, race in enumerate(RACE_KEYS):
         rows.append([ib(f"{RACES[race]['emoji']} {race}", f"col:r{i}:0")])
     rows.append([ib("🧾 Все карты", "col:all:0")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, "🎭 <b>Коллекция — фильтр по расе:</b>",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -2944,7 +2961,7 @@ async def cb_collection_rarities(call: CallbackQuery):
     # Выбор фильтра по редкости
     rows = [[ib(rarity_label(k), f"col:q{i}:0")] for i, k in enumerate(RARITY_KEYS)]
     rows.append([ib("🧾 Все карты", "col:all:0")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, "✨ <b>Коллекция — фильтр по редкости:</b>",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -2952,7 +2969,7 @@ async def cb_collection_rarities(call: CallbackQuery):
 @router.callback_query(F.data.startswith("dk:"))
 async def cb_deck(call: CallbackQuery):
     text, markup = await battle_deck_screen(call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, markup)
 
 
@@ -2961,7 +2978,7 @@ async def cb_card(call: CallbackQuery):
     parts = call.data.split(":")
     cid, ctx, page = parts[1], parts[2], parts[3] if len(parts) > 3 else "0"
     row = await db_get_card(int(cid), call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     if not row:
         await safe_edit(call, "Карта не найдена.", kb([ib("⬅️ Назад", back_cb(ctx, page))]))
         return
@@ -2974,19 +2991,19 @@ async def cb_toggle_deck(call: CallbackQuery):
     cid, ctx, page = parts[1], parts[2], parts[3] if len(parts) > 3 else "0"
     row = await db_get_card(int(cid), call.from_user.id)
     if not row:
-        await call.answer("Карта не найдена.", show_alert=True)
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
         return
     if row["in_deck"]:
         await db_set_in_deck(row["id"], 0)
-        await call.answer("Убрано из колоды")
+        await safe_answer(call, "Убрано из колоды")
     else:
         if DECK_LIMIT_ENABLED:
             cards = await db_user_cards(call.from_user.id)
             if sum(c["in_deck"] for c in cards) >= MAX_DECK:
-                await call.answer(f"В колоде не может быть больше {MAX_DECK} карт!", show_alert=True)
+                await safe_answer(call, f"В колоде не может быть больше {MAX_DECK} карт!", show_alert=True)
                 return
         await db_set_in_deck(row["id"], 1)
-        await call.answer("Добавлено в колоду")
+        await safe_answer(call, "Добавлено в колоду")
     row = await db_get_card(int(cid), call.from_user.id)
     await safe_edit(call, card_text(row), card_kb(row["id"], row["in_deck"], ctx, page))
 
@@ -2995,7 +3012,7 @@ async def cb_toggle_deck(call: CallbackQuery):
 async def cb_delete_ask(call: CallbackQuery):
     parts = call.data.split(":")
     cid, ctx, page = parts[1], parts[2], parts[3] if len(parts) > 3 else "0"
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, "🗑 <b>Сбросить карту навсегда?</b>",
                     kb([ib("✅ Да, сбросить", f"dkx:{cid}:{ctx}:{page}"),
                         ib("⬅️ Отмена", f"card:{cid}:{ctx}:{page}")]))
@@ -3006,7 +3023,7 @@ async def cb_delete_yes(call: CallbackQuery):
     parts = call.data.split(":")
     cid, ctx, page = parts[1], parts[2], parts[3] if len(parts) > 3 else "0"
     await db_delete_card(int(cid), call.from_user.id)
-    await call.answer("Карта сброшена")
+    await safe_answer(call, "Карта сброшена")
     text, markup = await ctx_screen(call.from_user.id, ctx, page)
     await safe_edit(call, text, markup)
 
@@ -3069,7 +3086,7 @@ async def get_new_card(user_id: int):
 @router.callback_query(F.data == "getc")
 async def cb_get_card(call: CallbackQuery):
     text, markup = await get_new_card(call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, markup)
 
 
@@ -3111,19 +3128,19 @@ async def cb_battle_start(call: CallbackQuery):
     layout_key = call.data.split(":")[1]
     user_id = call.from_user.id
     if layout_key not in LAYOUTS:
-        await call.answer("Неизвестная раскладка.", show_alert=True)
+        await safe_answer(call, "Неизвестная раскладка.", show_alert=True)
         return
     if await db_load_battle(user_id):
-        await call.answer("У вас уже идёт бой!", show_alert=True)
+        await safe_answer(call, "У вас уже идёт бой!", show_alert=True)
         return
     cards = await db_battle_cards(user_id)
     if not cards:
-        await call.answer("Колода пуста! Добавьте карты в колоду в коллекции.", show_alert=True)
+        await safe_answer(call, "Колода пуста! Добавьте карты в колоду в коллекции.", show_alert=True)
         return
     state = create_battle(cards, layout_key)
     log_add(state, "⚔️ Бой начался! Нажмите на клетку поля, чтобы действовать. Удачи!")
     await db_save_battle(user_id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3131,10 +3148,10 @@ async def load_active_battle(call: CallbackQuery):
     # Загружает активный бой или объясняет пользователю, что боя нет
     state = await db_load_battle(call.from_user.id)
     if state is None:
-        await call.answer("У вас нет активного боя.", show_alert=True)
+        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return None
     if state["over"]:
-        await call.answer("Бой уже завершён.", show_alert=True)
+        await safe_answer(call, "Бой уже завершён.", show_alert=True)
         return None
     return state
 
@@ -3148,7 +3165,7 @@ async def finish_player_action(call: CallbackQuery, state: dict):
         await end_battle(call.from_user.id, state)
     else:
         await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3216,7 +3233,7 @@ async def end_battle(user_id: int, state: dict) -> bool:
 @router.callback_query(F.data == "bt:view")
 async def cb_battle_view(call: CallbackQuery):
     state = await db_load_battle(call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     if state is None:
         await safe_edit(call, "У вас нет активного боя.\n\n" + MENU_TEXT, None)
         return
@@ -3231,11 +3248,11 @@ async def cb_battle_again(call: CallbackQuery):
         # прервался перезапуском — показываем экран завершения/очков.
         if st["over"] and pending_levels_total(st) == 0:
             await end_battle(call.from_user.id, st)
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, battle_text(st), kb_battle(st))
         return
     text, markup = await battle_setup_screen(call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, markup)
 
 
@@ -3248,7 +3265,7 @@ async def cb_cell_click(call: CallbackQuery):
     _, line, pos_s = call.data.split(":")
     pos = int(pos_s)
     if line not in ROWS or not cell_exists(state, line, pos):
-        await call.answer("Здесь нет клетки.", show_alert=True)
+        await safe_answer(call, "Здесь нет клетки.", show_alert=True)
         return
 
     pend = state.get("pending")
@@ -3270,7 +3287,7 @@ async def cb_cell_click(call: CallbackQuery):
         if w["owner"] == "enemy":
             await show_wall_choice(call, state, line, pos, w)
         else:
-            await call.answer(f"🧱 Это ваша стена: HP {w['hp']}, КЗ {w['armor']}. "
+            await safe_answer(call, f"🧱 Это ваша стена: HP {w['hp']}, КЗ {w['armor']}. "
                               f"Она даёт +3 КЗ вашему тылу и служит заслоном.", show_alert=True)
     else:
         # Клик по пустой клетке: захват = выбрать, кем переместиться
@@ -3285,7 +3302,7 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
     if u is None or p_side != "player":
         state["pending"] = None
         await db_save_battle(call.from_user.id, state)
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, battle_text(state), kb_battle(state))
         return
     # Для высадки карта ДОЛЖНА быть в колоде; для остальных режимов — на доске
@@ -3293,13 +3310,13 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
         if u_line != "deck":
             state["pending"] = None
             await db_save_battle(call.from_user.id, state)
-            await call.answer("Эта карта уже не в колоде.", show_alert=True)
+            await safe_answer(call, "Эта карта уже не в колоде.", show_alert=True)
             await safe_edit(call, battle_text(state), kb_battle(state))
             return
     elif u_line in (None, "deck", "graveyard"):
         state["pending"] = None
         await db_save_battle(call.from_user.id, state)
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, battle_text(state), kb_battle(state))
         return
 
@@ -3308,30 +3325,30 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
 
     if act in ("attack", "stealth"):
         if target is None and not (wall is not None and act == "attack" and wall["owner"] != "player"):
-            await call.answer("Пустая клетка — атаковать некого. "
+            await safe_answer(call, "Пустая клетка — атаковать некого. "
                               "Для захвата клетки используйте 🚶 Перемещение.", show_alert=True)
             return
         if target is not None and target["side"] == "player":
             # По заданию: бить союзника нельзя (свою стену — тоже)
-            await call.answer("❌ Атаковать союзника нельзя! Выберите вражеского юнита.", show_alert=True)
+            await safe_answer(call, "❌ Атаковать союзника нельзя! Выберите вражеского юнита.", show_alert=True)
             return
         if wall is not None and wall["owner"] == "player":
-            await call.answer("Это ваша собственная стена.", show_alert=True)
+            await safe_answer(call, "Это ваша собственная стена.", show_alert=True)
             return
         stealth = act == "stealth"
         if stealth and wall is not None:
-            await call.answer("🗡 Скрытая атака бьёт только по юнитам тыла (В2).", show_alert=True)
+            await safe_answer(call, "🗡 Скрытая атака бьёт только по юнитам тыла (В2).", show_alert=True)
             return
         if stealth and not can_stealth_attack(u, line):
-            await call.answer("🗡 Скрытая атака бьёт только по тылу врага (В2).", show_alert=True)
+            await safe_answer(call, "🗡 Скрытая атака бьёт только по тылу врага (В2).", show_alert=True)
             return
         if not stealth and not can_normal_attack(u, line):
-            await call.answer("⚔️ Обычная атака не достаёт эту линию: нужен фронт врага (В1) "
+            await safe_answer(call, "⚔️ Обычная атака не достаёт эту линию: нужен фронт врага (В1) "
                               "или своя/соседняя линия. Попробуйте переместиться ближе.", show_alert=True)
             return
         err = attacker_error(u, stealth)
         if err:
-            await call.answer(err, show_alert=True)
+            await safe_answer(call, err, show_alert=True)
             return
         state["pending"] = None
         perform_attack(state, "player", u, line, pos, stealth=stealth)
@@ -3343,7 +3360,7 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
         sp = SPELLS[pend["spell"]]
         err = spell_target_error(state, "player", sp, line, pos, target, wall)
         if err:
-            await call.answer(err, show_alert=True)
+            await safe_answer(call, err, show_alert=True)
             return
         state["pending"] = None
         spec = ({"kind": "unit", "uid": target["uid"]} if sp["target"] in ("enemy_unit", "ally_unit")
@@ -3354,10 +3371,10 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
 
     if act == "move":
         if target is not None or wall is not None:
-            await call.answer("Клетка занята — переместиться на неё нельзя.", show_alert=True)
+            await safe_answer(call, "Клетка занята — переместиться на неё нельзя.", show_alert=True)
             return
         if not can_move_to(state, u, line, pos):
-            await call.answer("Сюда не добраться: нужна пустая клетка на своей или "
+            await safe_answer(call, "Сюда не добраться: нужна пустая клетка на своей или "
                               "соседней линии (В2↔В1↔С1↔С2).", show_alert=True)
             return
         state["pending"] = None
@@ -3367,14 +3384,14 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
 
     if act == "place":
         if ROW_SIDE[line] != "player":
-            await call.answer("Высаживать карты можно только на свои линии (С1/С2). "
+            await safe_answer(call, "Высаживать карты можно только на свои линии (С1/С2). "
                               "Дальше — только перемещением!", show_alert=True)
             return
         if target is not None or wall is not None:
-            await call.answer("Клетка занята.", show_alert=True)
+            await safe_answer(call, "Клетка занята.", show_alert=True)
             return
         if u_line != "deck":
-            await call.answer("Эта карта уже не в колоде.", show_alert=True)
+            await safe_answer(call, "Эта карта уже не в колоде.", show_alert=True)
             return
         state["pending"] = None
         perform_place(state, "player", line, pos, u)
@@ -3395,14 +3412,14 @@ async def show_attacker_choice(call: CallbackQuery, state: dict, line: str, pos:
             cost = f" ({MAGE_STEALTH_MANA}🔮)" if a["cls"] == CLS_MAGE else ""
             btns.append(ib(f"🗡 {a['name']} — скрытая{cost}", f"SA:{a['uid']}:{tgt['uid']}"))
     if not btns:
-        await call.answer("Никто из ваших юнитов сейчас не может достать эту цель "
+        await safe_answer(call, "Никто из ваших юнитов сейчас не может достать эту цель "
                           "(истощение, не хватает манны или линии не в досягаемости).", show_alert=True)
         return
     text = (f"🎯 <b>Цель: {ROW_LABEL[line]}:{pos}</b>\n{unit_info(tgt)}\n\n"
             f"Кем и как атаковать?")
     rows = [[b] for b in btns]
     rows.append([ib("✖ Отменить", "X")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -3412,7 +3429,7 @@ async def show_move_choice(call: CallbackQuery, state: dict, line: str, pos: int
     cands = [u for _, _, u in board_units(state, "player") if can_move_to(state, u, line, pos)]
     can_place = (ROW_SIDE[line] == "player" and bool(state["player"]["deck"]))
     if not cands and not can_place:
-        await call.answer("Сюда никто не может переместиться: нужна пустая клетка на "
+        await safe_answer(call, "Сюда никто не может переместиться: нужна пустая клетка на "
                           "своей или соседней линии и выносливость ≥ 1.", show_alert=True)
         return
     text = (f"🚩 <b>Клетка {ROW_LABEL[line]}:{pos} пуста.</b>\n"
@@ -3424,7 +3441,7 @@ async def show_move_choice(call: CallbackQuery, state: dict, line: str, pos: int
     if can_place:
         rows.append([ib("📥 Высадить карту из колоды сюда", f"PCP:{line}:{pos}")])
     rows.append([ib("✖ Отменить", "X")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -3438,10 +3455,10 @@ async def cb_place_pick(call: CallbackQuery):
     pos = int(pos_s)
     if ROW_SIDE[line] != "player" or not cell_exists(state, line, pos) \
             or cell_unit(state, line, pos) is not None:
-        await call.answer("Сюда нельзя поставить карту.", show_alert=True)
+        await safe_answer(call, "Сюда нельзя поставить карту.", show_alert=True)
         return
     if not state["player"]["deck"]:
-        await call.answer("Колода пуста.", show_alert=True)
+        await safe_answer(call, "Колода пуста.", show_alert=True)
         return
     await show_cards_for_cell(call, state, line, pos)
 
@@ -3466,7 +3483,7 @@ async def show_unit_menu(call: CallbackQuery, state: dict, u: dict):
             rows.append([ib(f"✨ Магия (известно: {len(known_spells(u))})", f"SP:{u['uid']}")])
         rows.append([ib("✖ Отменить", "X")])
         markup = InlineKeyboardMarkup(inline_keyboard=rows)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, markup)
 
 
@@ -3479,7 +3496,7 @@ async def show_cards_for_cell(call: CallbackQuery, state: dict, line: str, pos: 
         rows.append([ib(f"{CLS_EMOJI[u['cls']]} {u['name']} L{u['level']} ⚡{u['end']}",
                         f"PC:{line}:{pos}:{u['uid']}")])
     rows.append([ib("✖ Отменить", "X")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -3489,7 +3506,7 @@ async def get_board_unit(call: CallbackQuery, state: dict, uid: int):
     # Достаёт своего юнита с доски или объясняет, почему не получилось
     side, u, line, pos = find_unit(state, uid)
     if u is None or side != "player" or line in (None, "deck", "graveyard"):
-        await call.answer("Карта не на поле.", show_alert=True)
+        await safe_answer(call, "Карта не на поле.", show_alert=True)
         return None
     return u
 
@@ -3506,18 +3523,18 @@ async def cb_enter_attack_mode(call: CallbackQuery):
         return
     err = attacker_error(u, stealth=False)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     # Есть ли хоть одна доступная цель для обычной атаки?
     has_target = any(can_normal_attack(u, tl)
                      for tl, _, t in board_units(state, "enemy"))
     if not has_target:
-        await call.answer("Нет целей, которых достанет обычная атака "
+        await safe_answer(call, "Нет целей, которых достанет обычная атака "
                           "(фронт В1 или своя/соседняя линия).", show_alert=True)
         return
     state["pending"] = {"act": "attack", "uid": uid}
     await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3533,13 +3550,13 @@ async def cb_stealth_ask(call: CallbackQuery):
         return
     err = attacker_error(u, stealth=True)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     enemy_rear = row_of("enemy", "rear")
     if not any(tl == enemy_rear for tl, _, _ in board_units(state, "enemy")):
-        await call.answer("Во вражеском тылу (В2) нет целей.", show_alert=True)
+        await safe_answer(call, "Во вражеском тылу (В2) нет целей.", show_alert=True)
         return
-    await call.answer()
+    await safe_answer(call)
     text = (f"🗡 <b>Скрытая атака</b>\n{unit_info(u)}\n\n"
             f"Карта ударит по тылу врага (В2) через заслон фронта — попадание ниже обычного. "
             f"Уверены, что хотите совершить скрытую атаку?")
@@ -3557,7 +3574,7 @@ async def cb_stealth_yes(call: CallbackQuery):
         return
     state["pending"] = {"act": "stealth", "uid": uid}
     await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3572,17 +3589,17 @@ async def cb_enter_move_mode(call: CallbackQuery):
     if u is None:
         return
     if u["end"] <= 0:
-        await call.answer("💤 Карта истощена и не может действовать!", show_alert=True)
+        await safe_answer(call, "💤 Карта истощена и не может действовать!", show_alert=True)
         return
     has_cell = any(can_move_to(state, u, line, pos)
                    for line in ROWS for pos in row_layout(state, line))
     if not has_cell:
-        await call.answer("Нет доступных клеток: своя и соседние линии заняты "
+        await safe_answer(call, "Нет доступных клеток: своя и соседние линии заняты "
                           "или не существуют.", show_alert=True)
         return
     state["pending"] = {"act": "move", "uid": uid}
     await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3596,7 +3613,7 @@ async def cb_defend(call: CallbackQuery):
     if u is None:
         return
     if u["end"] <= 0:
-        await call.answer("💤 Карта истощена и не может действовать!", show_alert=True)
+        await safe_answer(call, "💤 Карта истощена и не может действовать!", show_alert=True)
         return
     perform_defend(state, "player", u)
     await finish_player_action(call, state)
@@ -3612,7 +3629,7 @@ async def cb_retreat(call: CallbackQuery):
     if u is None:
         return
     if u["end"] <= 0:
-        await call.answer("💤 Карта истощена — даже отход требует выносливость!", show_alert=True)
+        await safe_answer(call, "💤 Карта истощена — даже отход требует выносливость!", show_alert=True)
         return
     perform_retreat(state, "player", u)
     await finish_player_action(call, state)
@@ -3643,15 +3660,15 @@ async def cb_spell_menu(call: CallbackQuery):
     if u is None:
         return
     if u["cls"] != CLS_MAGE:
-        await call.answer("Кастовать могут только заклинатели 🔮.", show_alert=True)
+        await safe_answer(call, "Кастовать могут только заклинатели 🔮.", show_alert=True)
         return
     known = known_spells(u)
     if not known:
-        await call.answer(f"Заклинания откроются с ростом уровня и редкости карты "
+        await safe_answer(call, f"Заклинания откроются с ростом уровня и редкости карты "
                           f"(сейчас L{u['level']}, {rarity_label(u.get('rarity', 'common'))}).",
                           show_alert=True)
         return
-    await call.answer()
+    await safe_answer(call)
     text = (unit_info(u) + "\n\n✨ <b>Книга заклинаний</b> — каст тратит ВЕСЬ пул манны, "
             "1⚡ и всё действие хода. 🔒 — пока недоступно (уровень/редкость/манна):")
     rows = []
@@ -3673,22 +3690,22 @@ async def cb_spell_pick(call: CallbackQuery):
     parts = call.data.split(":")
     uid, sid = int(parts[1]), parts[2]
     if sid not in SPELLS:
-        await call.answer("Неизвестное заклинание.", show_alert=True)
+        await safe_answer(call, "Неизвестное заклинание.", show_alert=True)
         return
     side, u, line, _ = find_unit(state, uid)
     if u is None or side != "player" or line not in ROWS:
-        await call.answer("Карта не на поле.", show_alert=True)
+        await safe_answer(call, "Карта не на поле.", show_alert=True)
         return
     err = spell_ready(state, u, sid)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     sp = SPELLS[sid]
     t = sp["target"]
 
     if t in ("all_enemies", "all_allies", "all_enemy_cells"):
         # Мгновенное массовое заклинание — с подтверждением
-        await call.answer()
+        await safe_answer(call)
         scope = {"all_enemies": "ВСЕМ врагам", "all_allies": "ВСЕМ союзникам",
                  "all_enemy_cells": "ВСЕМ клеткам врага"}[t]
         text = (f"{sp['emoji']} <b>«{sp['name']}»</b> — {scope}.\n{sp['desc']}\n\n"
@@ -3706,10 +3723,10 @@ async def cb_spell_pick(call: CallbackQuery):
             if n > 0:
                 rows.append([ib(f"{ROW_LABEL[ln]} — юнитов: {n}", f"SPLT:{uid}:{sid}:{ln}")])
         if not rows:
-            await call.answer("Нет подходящих линий с юнитами.", show_alert=True)
+            await safe_answer(call, "Нет подходящих линий с юнитами.", show_alert=True)
             return
         rows.append([ib("✖ Отменить", f"UM:{uid}")])
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, f"{sp['emoji']} <b>«{sp['name']}»</b> — выберите линию:\n{sp['desc']}",
                         InlineKeyboardMarkup(inline_keyboard=rows))
         return
@@ -3720,7 +3737,7 @@ async def cb_spell_pick(call: CallbackQuery):
         for g in state["player"]["graveyard"]:
             rows.append([ib(f"💀 {g['name']} {g['surname']} L{g['level']}", f"SPG:{uid}:{sid}:{g['uid']}")])
         rows.append([ib("✖ Отменить", f"UM:{uid}")])
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, f"{sp['emoji']} <b>«{sp['name']}»</b> — кого вернуть из павших?\n{sp['desc']}",
                         InlineKeyboardMarkup(inline_keyboard=rows))
         return
@@ -3728,7 +3745,7 @@ async def cb_spell_pick(call: CallbackQuery):
     # Целевые заклинания (юнит/клетка): режим «следующий клик — цель»
     state["pending"] = {"act": "spell", "uid": uid, "spell": sid}
     await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -3742,11 +3759,11 @@ async def cb_spell_cast_global(call: CallbackQuery):
     uid, sid = int(parts[1]), parts[2]
     side, u, line, _ = find_unit(state, uid)
     if u is None or side != "player" or line not in ROWS:
-        await call.answer("Карта не на поле.", show_alert=True)
+        await safe_answer(call, "Карта не на поле.", show_alert=True)
         return
     err = spell_ready(state, u, sid)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     cast_spell(state, "player", u, sid, None)
     await finish_player_action(call, state)
@@ -3762,16 +3779,16 @@ async def cb_spell_cast_line(call: CallbackQuery):
     uid, sid, line = int(parts[1]), parts[2], parts[3]
     side, u, u_line, _ = find_unit(state, uid)
     if u is None or side != "player" or u_line not in ROWS:
-        await call.answer("Карта не на поле.", show_alert=True)
+        await safe_answer(call, "Карта не на поле.", show_alert=True)
         return
     err = spell_ready(state, u, sid)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     sp = SPELLS[sid]
     want_side = "enemy" if sp["target"] == "enemy_line" else "player"
     if not any(l2 == line for l2, _, _ in board_units(state, want_side)):
-        await call.answer("На этой линии больше нет целей.", show_alert=True)
+        await safe_answer(call, "На этой линии больше нет целей.", show_alert=True)
         return
     cast_spell(state, "player", u, sid, {"kind": "line", "line": line})
     await finish_player_action(call, state)
@@ -3787,15 +3804,15 @@ async def cb_spell_cast_grave(call: CallbackQuery):
     uid, sid, duid = int(parts[1]), parts[2], int(parts[3])
     side, u, line, _ = find_unit(state, uid)
     if u is None or side != "player" or line not in ROWS:
-        await call.answer("Карта не на поле.", show_alert=True)
+        await safe_answer(call, "Карта не на поле.", show_alert=True)
         return
     err = spell_ready(state, u, sid)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     dead = next((g for g in state["player"]["graveyard"] if g["uid"] == duid), None)
     if dead is None:
-        await call.answer("Эта карта уже недоступна.", show_alert=True)
+        await safe_answer(call, "Эта карта уже недоступна.", show_alert=True)
         return
     cast_spell(state, "player", u, sid, {"kind": "grave", "uid": duid})
     await finish_player_action(call, state)
@@ -3810,13 +3827,13 @@ async def show_wall_choice(call: CallbackQuery, state: dict, line: str, pos: int
              and not has_fx(u, "frozen") and not has_fx(u, "time_lock")
              and (u["cls"] != CLS_MAGE or u["mana"] >= MAGE_ATTACK_MANA)]
     if not cands:
-        await call.answer("Никто из юнитов не может ударить по этой стене.", show_alert=True)
+        await safe_answer(call, "Никто из юнитов не может ударить по этой стене.", show_alert=True)
         return
     text = (f"🧱 <b>Вражеская стена {ROW_LABEL[line]}:{pos}</b>: HP {w['hp']}, КЗ {w['armor']}.\n"
             f"Она мешает двигаться, даёт тылу врага +3 КЗ и служит заслоном от скрытых атак. Кем сломать?")
     rows = [[ib(f"⚔️ {u['name']} ⚔{atk_eff(u, state)}", f"EW:{u['uid']}:{line}:{pos}")] for u in cands]
     rows.append([ib("✖ Отменить", "X")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -3829,15 +3846,15 @@ async def cb_attack_wall(call: CallbackQuery):
     uid, line, pos = int(parts[1]), parts[2], int(parts[3])
     side, u, u_line, _ = find_unit(state, uid)
     if u is None or side != "player" or u_line not in ROWS:
-        await call.answer("Атакующий недоступен.", show_alert=True)
+        await safe_answer(call, "Атакующий недоступен.", show_alert=True)
         return
     err = attacker_error(u, stealth=False)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     w = get_wall(state, line, pos)
     if w is None or w["owner"] == "player" or not can_normal_attack(u, line):
-        await call.answer("Стена больше недоступна для удара.", show_alert=True)
+        await safe_answer(call, "Стена больше недоступна для удара.", show_alert=True)
         return
     perform_attack(state, "player", u, line, pos, stealth=False)
     await finish_player_action(call, state)
@@ -3847,7 +3864,7 @@ async def cb_attack_wall(call: CallbackQuery):
 async def cb_cancel(call: CallbackQuery):
     # «✖ Отменить» — сбрасывает режим выбора цели/клетки
     state = await db_load_battle(call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
     if state is None:
         await safe_edit(call, MENU_TEXT, None)
         return
@@ -3863,19 +3880,19 @@ async def exec_attack_on_unit(call: CallbackQuery, state: dict, a_uid: int, t_ui
     # Общая реализация удара по конкретному вражескому юниту
     a_side, a, a_line, _ = find_unit(state, a_uid)
     if a is None or a_side != "player" or a_line in (None, "deck", "graveyard"):
-        await call.answer("Атакующий недоступен.", show_alert=True)
+        await safe_answer(call, "Атакующий недоступен.", show_alert=True)
         return
     err = attacker_error(a, stealth)
     if err:
-        await call.answer(err, show_alert=True)
+        await safe_answer(call, err, show_alert=True)
         return
     t_side, t, t_line, t_pos = find_unit(state, t_uid)
     if t is None or t_side != "enemy" or t_line in (None, "deck", "graveyard"):
-        await call.answer("Цель больше недоступна.", show_alert=True)
+        await safe_answer(call, "Цель больше недоступна.", show_alert=True)
         return
     ok = can_stealth_attack(a, t_line) if stealth else can_normal_attack(a, t_line)
     if not ok:
-        await call.answer("Цель вне досягаемости этого вида атаки — выберите заново.", show_alert=True)
+        await safe_answer(call, "Цель вне досягаемости этого вида атаки — выберите заново.", show_alert=True)
         return
     perform_attack(state, "player", a, t_line, t_pos, stealth=stealth)
     await finish_player_action(call, state)
@@ -3901,9 +3918,9 @@ async def cb_stealth_from_target(call: CallbackQuery):
     a = find_unit(state, int(a_s))[1]
     t = find_unit(state, int(t_s))[1]
     if a is None or t is None:
-        await call.answer("Цель или атакующий недоступны.", show_alert=True)
+        await safe_answer(call, "Цель или атакующий недоступны.", show_alert=True)
         return
-    await call.answer()
+    await safe_answer(call)
     text = (f"🗡 <b>Скрытая атака</b>\n{a['name']} ({CLS_NAME[a['cls']]}) → {t['name']} (тыл врага)\n\n"
             f"Уверены, что хотите совершить скрытую атаку?")
     await safe_edit(call, text,
@@ -3931,10 +3948,10 @@ async def cb_move_exec(call: CallbackQuery):
     uid, pos = int(uid_s), int(pos_s)
     side, u, u_line, _ = find_unit(state, uid)
     if u is None or side != "player" or u_line in (None, "deck", "graveyard"):
-        await call.answer("Юнит недоступен.", show_alert=True)
+        await safe_answer(call, "Юнит недоступен.", show_alert=True)
         return
     if not can_move_to(state, u, line, pos):
-        await call.answer("Перемещение туда невозможно (занято, нет клетки или "
+        await safe_answer(call, "Перемещение туда невозможно (занято, нет клетки или "
                           "линия не соседняя).", show_alert=True)
         return
     perform_move(state, "player", u, line, pos)
@@ -3953,11 +3970,11 @@ async def cb_place_on_cell(call: CallbackQuery):
     pos, uid = int(pos_s), int(uid_s)
     if ROW_SIDE[line] != "player" or not cell_exists(state, line, pos) \
             or cell_blocked(state, line, pos):
-        await call.answer("Сюда нельзя поставить карту.", show_alert=True)
+        await safe_answer(call, "Сюда нельзя поставить карту.", show_alert=True)
         return
     u = next((x for x in state["player"]["deck"] if x["uid"] == uid), None)
     if u is None:
-        await call.answer("Эта карта больше недоступна.", show_alert=True)
+        await safe_answer(call, "Эта карта больше недоступна.", show_alert=True)
         return
     perform_place(state, "player", line, pos, u)
     await finish_player_action(call, state)
@@ -3980,7 +3997,7 @@ async def cb_deck_tab(call: CallbackQuery):
     if not deck:
         text += "\n\n(пусто)"
     rows.append([ib("⬅️ Назад на поле", "bt:view")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -3993,14 +4010,14 @@ async def cb_deck_place(call: CallbackQuery):
     uid = int(call.data.split(":")[1])
     u = next((x for x in state["player"]["deck"] if x["uid"] == uid), None)
     if u is None:
-        await call.answer("Эта карта больше не в колоде.", show_alert=True)
+        await safe_answer(call, "Эта карта больше не в колоде.", show_alert=True)
         return
     if not own_empty_cells(state, "player"):
-        await call.answer("Нет свободных клеток для высадки.", show_alert=True)
+        await safe_answer(call, "Нет свободных клеток для высадки.", show_alert=True)
         return
     state["pending"] = {"act": "place", "uid": uid}
     await db_save_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -4010,14 +4027,14 @@ async def cb_deck_place(call: CallbackQuery):
 async def cb_levelup_list(call: CallbackQuery):
     state = await db_load_battle(call.from_user.id)
     if state is None:
-        await call.answer("У вас нет активного боя.", show_alert=True)
+        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return
     cands = [u for u in all_units(state, "player") if u.get("pending_levels", 0) > 0]
     if not cands:
         # Очков нет: если бой завершён — это страховка финала после сбоя
         if state["over"] and state.get("bonus_applied"):
             await end_battle(call.from_user.id, state)
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, battle_text(state), kb_battle(state))
         return
     text = "🌟 <b>Повышение уровня!</b>\nВыберите карту, чтобы распределить очки роста:"
@@ -4025,7 +4042,7 @@ async def cb_levelup_list(call: CallbackQuery):
                 f"LUS:{u['uid']}")]
             for u in cands]
     rows.append([ib("⬅️ Назад", "bt:view")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -4033,12 +4050,12 @@ async def cb_levelup_list(call: CallbackQuery):
 async def cb_levelup_stats(call: CallbackQuery):
     state = await db_load_battle(call.from_user.id)
     if state is None:
-        await call.answer("У вас нет активного боя.", show_alert=True)
+        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return
     uid = int(call.data.split(":")[1])
     _, u, _, _ = find_unit(state, uid)
     if u is None or u["side"] != "player" or u.get("pending_levels", 0) <= 0:
-        await call.answer("Нет доступных очков роста.", show_alert=True)
+        await safe_answer(call, "Нет доступных очков роста.", show_alert=True)
         return
     text = (unit_info(u) + f"\n\n🌟 Свободных очков роста: <b>{u['pending_levels']}</b>\n"
             f"Выберите, что повысить (одно очко = один выбор):")
@@ -4047,7 +4064,7 @@ async def cb_levelup_stats(call: CallbackQuery):
         label = sub_choice_label(u) if stat == "sub" else STAT_CHOICE_LABEL[stat]
         rows.append([ib(label, f"lup:{uid}:{stat}")])
     rows.append([ib("⬅️ Назад", "LU")])
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -4055,21 +4072,21 @@ async def cb_levelup_stats(call: CallbackQuery):
 async def cb_levelup_apply(call: CallbackQuery):
     state = await db_load_battle(call.from_user.id)
     if state is None:
-        await call.answer("У вас нет активного боя.", show_alert=True)
+        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return
     _, uid_s, stat = call.data.split(":")
     uid = int(uid_s)
     _, u, _, _ = find_unit(state, uid)
     if u is None or u["side"] != "player" or u.get("pending_levels", 0) <= 0:
-        await call.answer("Нет доступных очков роста.", show_alert=True)
+        await safe_answer(call, "Нет доступных очков роста.", show_alert=True)
         return
     if stat not in stat_choices_for(u):
-        await call.answer("Недоступный рост для этого класса.", show_alert=True)
+        await safe_answer(call, "Недоступный рост для этого класса.", show_alert=True)
         return
     apply_stat_choice(u, stat)
     label = sub_choice_label(u) if stat == "sub" else STAT_CHOICE_LABEL[stat]
     log_add(state, f"🌟 {u['name']} {u['surname']}: выбран рост — {label}")
-    await call.answer("✅ Рост применён")
+    await safe_answer(call, "✅ Рост применён")
     if state["over"]:
         # Бой уже завершён: применяем очко и пробуем финализировать
         # (если очков больше нет — итоги запишутся в БД).
@@ -4107,7 +4124,7 @@ async def cb_flee_ask(call: CallbackQuery):
     state = await load_active_battle(call)
     if not state:
         return
-    await call.answer()
+    await safe_answer(call)
     text = battle_text(state) + ("\n\n🏳 <b>Покинуть бой?</b>\nОпыт за убийства сохранится, "
                                  "но бонус за победу вы не получите, а бой будет проигран.")
     await safe_edit(call, text,
@@ -4118,7 +4135,7 @@ async def cb_flee_ask(call: CallbackQuery):
 async def cb_flee_do(call: CallbackQuery):
     state = await db_load_battle(call.from_user.id)
     if state is None:
-        await call.answer("У вас нет активного боя.", show_alert=True)
+        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return
     if not state["over"]:
         state["over"] = True
@@ -4126,7 +4143,7 @@ async def cb_flee_do(call: CallbackQuery):
         state["pending"] = None
         log_add(state, "🏳 Вы покинули поле боя.")
         await end_battle(call.from_user.id, state)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
 
@@ -4171,7 +4188,7 @@ async def admin_card_list(call: CallbackQuery, op: str, page: int):
               "rar": "✨ Смена редкости — выберите карту:",
               "del": "🗑 Удаление — выберите карту:"}
     if not cards:
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, "Карт нет. Выдайте их кнопкой «🎲 Выдать карту».",
                         kb([ib("🎲 Выдать карту", "adm:new")], [ib("🛠 Панель", "adm:root")]))
         return
@@ -4190,7 +4207,7 @@ async def admin_card_list(call: CallbackQuery, op: str, page: int):
     if page < n_pages - 1:
         nav.append(ib("▶️", f"adm:{op}:{page + 1}"))
     rows.append(nav)
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, titles[op], InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -4260,13 +4277,13 @@ async def run_battle_sims(user_id: int, n: int):
 async def cb_admin(call: CallbackQuery, bot: Bot):
     uid = call.from_user.id
     if not await user_flag(uid, "is_admin"):
-        await call.answer("Нужен админ-доступ: отправьте /admin.", show_alert=True)
+        await safe_answer(call, "Нужен админ-доступ: отправьте /admin.", show_alert=True)
         return
     parts = call.data.split(":")
     op = parts[1]
 
     if op == "root":
-        await call.answer()
+        await safe_answer(call)
         await safe_edit(call, admin_text(), admin_kb())
         return
 
@@ -4275,7 +4292,7 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             rows = [[ib("🎰 Случайная редкость", "adm:new:rand")]]
             rows += [[ib(rarity_label(k), f"adm:new:{k}")] for k in RARITY_KEYS]
             rows.append([ib("⬅️ Назад", "adm:root")])
-            await call.answer()
+            await safe_answer(call)
             await safe_edit(call, "🎲 <b>Выдача карты</b> — выберите редкость:",
                             InlineKeyboardMarkup(inline_keyboard=rows))
         else:
@@ -4284,14 +4301,14 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             cid = await db_add_card(uid, d)
             await db_set_in_deck(cid, 1)  # админская карта сразу в колоде
             row = await db_get_card(cid, uid)
-            await call.answer("Карта выдана ✅")
+            await safe_answer(call, "Карта выдана ✅")
             await safe_edit(call, "🎲 <b>Карта выдана</b> (сразу добавлена в колоду):\n\n" + card_text(row),
                             kb([ib("🎲 Выдать ещё", "adm:new")], [ib("🛠 Панель", "adm:root")]))
         return
 
     if op == "heal":
         await db_admin_heal_all(uid)
-        await call.answer("❤️ Все карты вылечены")
+        await safe_answer(call, "❤️ Все карты вылечены")
         await safe_edit(call, admin_text(), admin_kb())
         return
 
@@ -4303,22 +4320,22 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             cid = int(parts[3])
             row = await db_get_card(cid, uid)
             if not row:
-                await call.answer("Карта не найдена.", show_alert=True)
+                await safe_answer(call, "Карта не найдена.", show_alert=True)
                 return
             if op == "lvl":
                 markup = kb([ib("+1 уровень", f"adm:lvl:up:{cid}:1"), ib("+5 уровней", f"adm:lvl:up:{cid}:5")],
                             [ib("+10 уровней", f"adm:lvl:up:{cid}:10"), ib("⭐ До 10 уровня", f"adm:lvl:set:{cid}:10")],
                             [ib("⬅️ Назад", "adm:lvl:0")])
-                await call.answer()
+                await safe_answer(call)
                 await safe_edit(call, "⬆️ <b>Прокачка карты</b>\n\n" + card_text(row), markup)
             elif op == "rar":
                 rows = [[ib(rarity_label(k), f"adm:rar:set:{cid}:{k}")] for k in RARITY_KEYS]
                 rows.append([ib("⬅️ Назад", "adm:rar:0")])
-                await call.answer()
+                await safe_answer(call)
                 await safe_edit(call, "✨ <b>Смена редкости</b>\n\n" + card_text(row),
                                 InlineKeyboardMarkup(inline_keyboard=rows))
             else:
-                await call.answer()
+                await safe_answer(call)
                 await safe_edit(call, "🗑 <b>Удалить карту навсегда?</b>\n\n" + card_text(row),
                                 kb([ib("✅ Удалить", f"adm:del:yes:{cid}")], [ib("⬅️ Назад", "adm:del:0")]))
             return
@@ -4326,7 +4343,7 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             cid, n = int(parts[3]), int(parts[4])
             row = await db_get_card(cid, uid)
             if not row:
-                await call.answer("Карта не найдена.", show_alert=True)
+                await safe_answer(call, "Карта не найдена.", show_alert=True)
                 return
             d = {"level": row["level"], "attack": row["attack"], "armor": row["armor"],
                  "hp_max": row["hp_max"], "sub": row["sub"], "mana_max": row["mana_max"],
@@ -4336,7 +4353,7 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
                 apply_level_growth(d)  # админ-прокачка: рост применяется сразу
             await db_admin_set_stats(cid, d)
             row = await db_get_card(cid, uid)
-            await call.answer("⬆️ Прокачано")
+            await safe_answer(call, "⬆️ Прокачано")
             await safe_edit(call, card_text(row),
                             kb([ib("⬆️ Прокачать ещё", f"adm:lvl:pick:{cid}")], [ib("🛠 Панель", "adm:root")]))
             return
@@ -4345,14 +4362,14 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             if key in RARITY_INFO:
                 await db_set_rarity(cid, key, uid)
             row = await db_get_card(cid, uid)
-            await call.answer("✨ Редкость изменена")
+            await safe_answer(call, "✨ Редкость изменена")
             await safe_edit(call, card_text(row),
                             kb([ib("✨ Изменить ещё", f"adm:rar:pick:{cid}")], [ib("🛠 Панель", "adm:root")]))
             return
         if op == "del" and parts[2] == "yes":
             cid = int(parts[3])
             await db_delete_card(cid, uid)
-            await call.answer("🗑 Карта удалена")
+            await safe_answer(call, "🗑 Карта удалена")
             cards_left = await db_user_cards(uid)
             if cards_left:
                 await admin_card_list(call, "del", 0)
@@ -4365,14 +4382,14 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             ns = sorted({5, 10, 25, SIM_MAX_BATTLES})
             rows = [[ib(f"⚔️ Прогнать {x} боёв", f"adm:sim:run:{x}")] for x in ns if x < 50]
             rows.append([ib("⬅️ Назад", "adm:root")])
-            await call.answer()
+            await safe_answer(call)
             await safe_edit(call, "⚔️ <b>Прогон боёв</b> (N &lt; 50):\nВаша боевая колода против "
                                    "колоды аналогичной редкости. Полный лог ходов придёт файлом.",
                             InlineKeyboardMarkup(inline_keyboard=rows))
             return
         if parts[2] == "run":
             n = min(int(parts[3]), SIM_MAX_BATTLES)
-            await call.answer(f"⚔️ Прогоняю {n} боёв, пару секунд…")
+            await safe_answer(call, f"⚔️ Прогоняю {n} боёв, пару секунд…")
             summary, log_text = await run_battle_sims(uid, n)
             if summary is None:
                 await safe_edit(call, "⚔️ Боевая колода пуста — сначала соберите колоду (🃏 Колода → 📥 В колоду).",
@@ -4392,7 +4409,7 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
                             kb([ib("⚔️ Прогнать ещё", "adm:sim")], [ib("🛠 Панель", "adm:root")]))
             return
 
-    await call.answer()
+    await safe_answer(call)
     await safe_edit(call, admin_text(), admin_kb())
 
 
