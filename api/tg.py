@@ -1,49 +1,7 @@
-# Точка входа Vercel Serverless Function: Telegram webhook → aiogram.
-#
-# Деплой (из папки vercel/):  vercel deploy --prod
-# (или в настройках проекта Vercel: Root Directory = vercel)
-# Затем один раз зарегистрировать webhook (проще всего — скриптом):
-#   python3 webhook_tool.py set --url https://<ваш-проект>.vercel.app/tg
-# или вручную:
-#   https://api.telegram.org/bot<TOKEN>/setWebhook
-#       ?url=https://<ваш-проект>.vercel.app/tg
-#       &secret_token=<WEBHOOK_SECRET>
-#       &allowed_updates=["message","callback_query"]
-#
-# ---------------------------------------------------------------------
-# САМОДИАГНОСТИКА (главное для отладки «бот молчит»):
-#   GET https://<проект>.vercel.app/            — статус: env, версии, счётчики
-#   GET https://<проект>.vercel.app/diag?key=<WEBHOOK_SECRET>
-#       — полный отчёт: getMe, getWebhookInfo (адрес webhook, сколько
-#         обновлений зависло, последняя ошибка Telegram), проверка каждой
-#         таблицы Supabase, журнал последних запросов и ошибок,
-#         сквозной «probe» /start через весь код бота.
-#   Можно и так: /?diag=<WEBHOOK_SECRET>&probe=1
-# ---------------------------------------------------------------------
-#
-# Особенности serverless (учтены в коде):
-#  - Dispatcher создаётся один раз на контейнер, а Bot + aiohttp-сессии —
-#    НА КАЖДЫЙ ЗАПРОС и закрываются до отправки ответа. Причина: контейнер
-#    Lambda между запросами «замораживается», TCP-соединения в пуле умирают,
-#    и переиспользование старой сессии даёт молчаливые обрывы
-#    (ServerDisconnectedError) — внешне это выглядит как «бот не отвечает»;
-#  - весь ответ Telegram отправляется ДО возврата 200 (иначе заморозка
-#    контейнера обрывает запрос);
-#  - ошибки хендлеров НЕ тонут: пишутся в журнал, в логи, пользователю
-#    уходит сообщение с причиной, а Telegram получает 500 (и повторит);
-#  - секрет webhook проверяется по заголовку X-Telegram-Bot-Api-Secret-Token
-#    (страховка: если секрет «приехал» в пути — тоже принимаем, но пишем
-#    предупреждение в журнал);
-#  - состояние «ждём пароль» хранится в БД (users.awaiting_password),
-#    поэтому MemoryStorage/FSM не нужны — запросы могут попадать на
-#    разные контейнеры;
-#  - ЗАЩИТА ОТ ОШИБКИ СБОРКИ: если платформа не установила зависимости
-#    (requirements.txt не найден билдером), импорт повторяется из
-#    вендора api/_vendor/ (см. vendor_deps.py); если и это не удалось —
-#    функция отдаёт JSON-диагностику вместо немых 500.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -254,6 +212,7 @@ def _update_kind(update) -> str:
 async def _process_update(body: bytes) -> dict:
     """Прогоняет один апдейт через бота. Всё — в рамках одного запроса."""
     dp = _get_dispatcher()
+    t0 = time.time()
     await bot_app.db_init()                 # свежая сессия Supabase (REST)
     bot = _make_bot()                       # свежая сессия Telegram API
     info: dict = {"handled": None, "chat_id": None, "reply_method": None}
@@ -262,7 +221,12 @@ async def _process_update(body: bytes) -> dict:
         info["update_id"] = update.update_id
         info["update_type"] = _update_kind(update)
         info["chat_id"] = _chat_id_of(update)
+        t1 = time.time()
         result = await dp.feed_update(bot, update)      # вызовет хендлеры бота
+        # Замер фаз — видно в журнале /diag: init_ms (сессии+разбор апдейта)
+        # и feed_ms (сам хендлер: все походы в БД и к Telegram API).
+        info["init_ms"] = round((t1 - t0) * 1000)
+        info["feed_ms"] = round((time.time() - t1) * 1000)
         if isinstance(result, TelegramMethod):
             # Ответ, который нельзя отдать синхронно (например, answerCallbackQuery)
             await bot(result)
@@ -615,7 +579,7 @@ class handler(BaseHTTPRequestHandler):
                             "⚠️ Внутренняя ошибка бота:\n")
                     notified = _run(
                         _notify_user_error_wrap, chat_id,
-                        text + f"<code>{detail[:300]}</code>\n\n"
+                        text + f"<code>{html.escape(detail[:300])}</code>\n\n"
                         "Диагностика: откройте адрес функции с "
                         "<code>/diag?key=WEBHOOK_SECRET&amp;probe=1</code>")
             except Exception as e2:                       # noqa: BLE001
