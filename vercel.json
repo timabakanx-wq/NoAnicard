@@ -1,9 +1,7 @@
 {
   "version": 2,
   "regions": ["fra1"],
-  "builds": [
-    { "src": "api/tg.py", "use": "@vercel/python" }
-  ],
+  "builds": [],
   "routes": [
     { "src": "/tg", "dest": "api/tg.py" },
     { "src": "/diag", "dest": "api/tg.py" },
