@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import random
+import re
 import tempfile
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -141,6 +142,115 @@ def rarity_rank(r: str) -> int:
 
 def rarity_label(r: str) -> str:
     return RARITY_INFO.get(r, RARITY_INFO["common"])["label"]
+
+# =====================================================================
+# КОЛОДЫ (до 3), ОТОБРАЖЕНИЕ КАРТ И СОРТИРОВКА КОЛЛЕКЦИИ
+# =====================================================================
+
+# Сколько колод может собрать игрок. Колода карты хранится прямо в
+# cards.in_deck: 0 — вне колод, 1/2/3 — номер колоды (старые данные с
+# in_deck=1 автоматически считаются колодой №1 — миграция не нужна).
+DECK_COUNT = 3
+
+# С какого уровня можно даровать титул (кнопка в карточке коллекции)
+TITLE_MIN_LEVEL = 3
+
+# Критерии сортировки коллекции: (код, подпись). Код с «-» на конце —
+# по убыванию. По умолчанию — 📅 дата получения (id, как раньше).
+SORTS = [("id", "📅 Дата получения"), ("rar", "✨ Редкость"), ("lvl", "⭐ Уровень"),
+         ("atk", "⚔️ Атака"), ("def", "🛡 Защита"), ("hp", "❤️ Здоровье"),
+         ("mna", "🔮 Запас манны"), ("end", "⚡ Выносливость"),
+         ("sub", "🥷 Скрытность/🎯 Точность"), ("cls", "🧬 Класс"),
+         ("rac", "🎭 Раса"), ("nm", "🔤 Имя")]
+
+
+def sanitize_title(text: str) -> str:
+    # Титул вводится игроком и попадает в HTML-сообщения — вырезаем
+    # опасные символы и ограничиваем длину.
+    return re.sub(r"[<>&]", "", text or "").strip()[:32]
+
+
+def disp_name(x, surname: bool = True) -> str:
+    # Имя для показа: если карте дарован титул и включён режим
+    # «использовать как имя» — титул идёт ПЕРВЫМ, затем настоящие
+    # имя и фамилия: «Гроза Юга» Пупкин Васильев.
+    # x — строка из БД или боевой юнит (dict).
+    title = (x.get("title") or "").strip() if hasattr(x, "get") else ""
+    base = x["name"] + (f" {x['surname']}" if surname and x.get("surname") else "")
+    if title and x.get("use_title"):
+        return f"«{title}» {base}"
+    return base
+
+
+def main_stat(cls: str, attack: int, armor: int):
+    # Главная цифра карты: у воинов — что БОЛЬШЕ из атаки/защиты,
+    # у заклинателей — всегда атака. Возвращает (значок, число).
+    if cls == CLS_MAGE:
+        return "⚔", attack
+    return ("⚔", attack) if attack >= armor else ("🛡", armor)
+
+
+def card_line(c) -> str:
+    # Карта в одну строку (коллекция/колоды). Порядок по заказу:
+    # класс, редкость, уровень, имя, атака или защита (что больше;
+    # у магов всегда атака), здоровье у воинов / манна у заклинателей.
+    rem = rarity_label(c.get("rarity") or "common").split(" ")[0]
+    ico, val = main_stat(c["cls"], c["attack"], c["armor"])
+    if c["cls"] == CLS_MAGE:
+        res = f"🔮{c['mana_max']}"
+    else:
+        res = f"❤{c['hp']}" if c["hp"] >= c["hp_max"] else f"❤{c['hp']}/{c['hp_max']}"
+    return f"{CLS_EMOJI[c['cls']]}{rem} L{c['level']} {disp_name(c)} {ico}{val} {res}"
+
+
+def unit_line(u: dict) -> str:
+    # Та же строка, но для боевого юнита (вкладка «Колода»/высадка):
+    # ресурсы текущие, а при выносливости ≤1 вместо ❤/🔮 показывается
+    # молния с остатком: ⚡1/4.
+    ico, val = main_stat(u["cls"], u["attack"], u["armor"])
+    if u["end"] <= 1:
+        res = f"⚡{u['end']}/{u['end_max']}"
+    elif u["cls"] == CLS_MAGE:
+        res = f"🔮{u['mana']}"
+    else:
+        res = f"❤{u['hp']}"
+    return f"{CLS_EMOJI[u['cls']]}{ico}{val} {res} {u['name']} L{u['level']}"
+
+
+def sort_label(s: str) -> str:
+    code = s[:-1] if s.endswith("-") else s
+    for c, label in SORTS:
+        if c == code:
+            return label + (" 🔽" if s.endswith("-") else " 🔼")
+    return "📅 Дата получения 🔼"
+
+
+def sort_cards(cards, s: str):
+    # s — код критерия из SORTS, «-» на конце = по убыванию.
+    code = s[:-1] if s.endswith("-") else s
+    desc = s.endswith("-")
+    keyf = {
+        "id":  lambda c: c["id"],
+        "rar": lambda c: rarity_rank(c.get("rarity") or "common"),
+        "lvl": lambda c: c["level"],
+        "atk": lambda c: c["attack"],
+        "def": lambda c: c["armor"],
+        "hp":  lambda c: c["hp_max"],
+        "mna": lambda c: c["mana_max"],
+        "end": lambda c: c["end_max"],
+        "sub": lambda c: c["sub"],
+        "cls": lambda c: 0 if c["cls"] == CLS_WARRIOR else 1,
+        "rac": lambda c: RACE_KEYS.index(c["race"]) if c["race"] in RACE_KEYS else 99,
+        "nm":  lambda c: (c["name"] or "").lower(),
+    }.get(code)
+    if keyf is None:
+        return list(cards)
+    return sorted(cards, key=lambda c: (keyf(c), c["id"]), reverse=desc)
+
+
+def decks_of(cards) -> dict:
+    # Раскладывает карты по колодам {1: [...], 2: [...], 3: [...]}
+    return {n: [c for c in cards if c["in_deck"] == n] for n in range(1, DECK_COUNT + 1)}
 
 # =====================================================================
 # РАССЫ И ИМЕНА
@@ -436,10 +546,12 @@ async def db_user_cards(user_id: int):
         "user_id": f"eq.{user_id}", "select": "*", "order": "id.asc"})
 
 
-async def db_battle_cards(user_id: int):
-    # Карты «в колоде» — именно они идут в бой (не больше MAX_DECK, первые)
+async def db_battle_cards(user_id: int, deck: int = 1):
+    # Карты выбранной колоды (in_deck = номер колоды 1..3) — именно они
+    # идут в бой (не больше MAX_DECK, первые по id)
+    deck = max(1, min(int(deck), DECK_COUNT))
     return await _rest("GET", "cards", params={
-        "user_id": f"eq.{user_id}", "in_deck": "eq.1", "select": "*",
+        "user_id": f"eq.{user_id}", "in_deck": f"eq.{deck}", "select": "*",
         "order": "id.asc", "limit": str(MAX_DECK)})
 
 
@@ -459,8 +571,23 @@ async def db_admin_heal_all(user_id: int):
 
 
 async def db_set_in_deck(card_id: int, val: int):
+    # val: 0 — вне колод, 1..DECK_COUNT — номер колоды
     await _rest("PATCH", "cards", params={"id": f"eq.{card_id}"},
                 json_body={"in_deck": val})
+
+
+async def db_set_title(card_id: int, title: str, user_id: int):
+    # Дарованный титул (текст уже очищен sanitize_title)
+    await _rest("PATCH", "cards",
+                params={"id": f"eq.{card_id}", "user_id": f"eq.{user_id}"},
+                json_body={"title": title})
+
+
+async def db_set_use_title(card_id: int, val: int, user_id: int):
+    # Использовать титул как имя в бою/колодах/коллекции (1/0)
+    await _rest("PATCH", "cards",
+                params={"id": f"eq.{card_id}", "user_id": f"eq.{user_id}"},
+                json_body={"use_title": val})
 
 
 async def db_delete_card(card_id: int, user_id: int):
@@ -725,8 +852,14 @@ def create_battle(cards, layout_key: str, enemy_rarity: str = None) -> dict:
         "enemy": {"deck": [], "graveyard": []},
     }
     for c in cards:
+        # Титул (если игрок включил «использовать как имя») становится
+        # боевым именем юнита — он же попадёт в журнал, на поле и в меню.
+        nm = c["name"]
+        ttl = (c.get("title") or "").strip()
+        if ttl and c.get("use_title"):
+            nm = f"«{ttl}» {nm}"
         d = {
-            "name": c["name"], "surname": c["surname"], "race": c["race"], "cls": c["cls"],
+            "name": nm, "surname": c["surname"], "race": c["race"], "cls": c["cls"],
             "rarity": c["rarity"] if "rarity" in c.keys() else "common",
             "level": c["level"], "exp": c["exp"], "attack": c["attack"], "armor": c["armor"],
             "hp_max": c["hp_max"], "sub": c["sub"], "mana_max": c["mana_max"], "end_max": c["end_max"],
@@ -2282,9 +2415,11 @@ def unit_flags(u: dict) -> str:
 
 
 def cell_btn(state: dict, line: str, pos: int) -> InlineKeyboardButton:
-    # Одна клетка карты = одна кнопка. По заказу НА ПЕРВОМ МЕСТЕ в тексте
-    # кнопки — здоровье и выносливость, затем класс/имя и защита.
-    # 👹 — вражеский юнит/стена, 🧱 — стена, 🟢 — болото, ⬜ — пустая клетка.
+    # Одна клетка карты = одна кнопка. Порядок значков (по заказу):
+    #   стикер класса → главная цифра (⚔ атака или 🛡 защита — что больше;
+    #   у заклинателей всегда ⚔) → ❤ здоровье у воинов / 🔮 манна у магов;
+    #   если выносливость ≤ 1 — ВМЕСТО здоровья/манны показываем ⚡остаток/запас.
+    # Затем имя и флаги состояния. 👹 — враг, 🧱 — стена, 🟢 — болото, ⬜ — пусто.
     cb = f"c:{line}:{pos}"
     if not cell_exists(state, line, pos):
         return ib("▫️", cb)
@@ -2299,11 +2434,15 @@ def cell_btn(state: dict, line: str, pos: int) -> InlineKeyboardButton:
         return ib(pre + "⬜", cb)
     flags = unit_flags(u)
     ce = CLS_EMOJI[u["cls"]]
-    if u["side"] == "player":
-        mana = f" 🔮{u['mana']}" if u["cls"] == CLS_MAGE else ""
-        text = f"❤{u['hp']} ⚡{u['end']} {pre}{ce}{u['name']} 🛡{u['armor']}{mana}{flags}"
+    ico, val = main_stat(u["cls"], atk_eff(u, state), eff_armor(u, state))
+    if u["end"] <= 1:
+        res = f"⚡{u['end']}/{u['end_max']}"
+    elif u["cls"] == CLS_MAGE:
+        res = f"🔮{u['mana']}"
     else:
-        text = f"❤{u['hp']} ⚡{u['end']} {pre}👹{ce}{u['name']} 🛡{u['armor']}{flags}"
+        res = f"❤{u['hp']}"
+    foe = "" if u["side"] == "player" else "👹"
+    text = f"{pre}{foe}{ce}{ico}{val} {res} {u['name']} {flags}"
     return ib(text[:64], cb)
 
 
@@ -2321,6 +2460,9 @@ def kb_battle(state: dict) -> InlineKeyboardMarkup:
     # + вкладка колоды + управление
     rows = [[cell_btn(state, line, p) for p in row_cells(state, line)] for line in ROWS]
     bottom = [ib(f"🃏 Колода ({len(state['player']['deck'])})", "DK")]
+    if not state["over"]:
+        # Книга заклинаний теперь прямо на карте боя: кастер → заклинание → цель
+        bottom.append(ib("✨ Магия", "SB"))
     pl = pending_levels_total(state)
     if pl > 0:
         bottom.append(ib(f"🌟 Уровень! ({pl})", "LU"))
@@ -2527,8 +2669,8 @@ def spell_target_error(state: dict, side: str, sp: dict, line: str, pos: int,
 # =====================================================================
 
 MENU_TEXT = ("🏠 <b>Главное меню</b>\n\n"
-             "📚 Коллекция — все ваши карты (фильтры, просмотр)\n"
-             "🃏 Колода — боевой набор, который пойдёт в сражение\n"
+             "📚 Коллекция — все ваши карты (фильтры, сортировка, просмотр)\n"
+             "🃏 Колода — до 3 боевых колод; ⭐приоритетная идёт в бой без вопроса\n"
              "🎲 Получить карту — новая случайная карта\n"
              "⚔️ Бой — сражение с ботом-противником\n"
              "❓ Помощь — правила игры")
@@ -2540,7 +2682,8 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • <b>Заклинатель 🔮</b> — дальние заклинания за манну. Пары: Атака↔Запас Манны, Здоровье↔Точность.
 • Карты генерируются случайно: 10 рас, по 20 имён и 20 фамилий на расу (200×200 = 4000 сочетаний). Полные имена в вашей коллекции не повторяются: при исчерпании пула добавляется римский суффикс («Торгрим Железнобород II»). Пока получение карт не ограничено.
 • ✨ РЕДКОСТИ: ⬜ Обычная (50%) / 🟩 Необычная (27%) / 🟦 Редкая (15%) / 🟪 Эпическая (6%) / 🟨 Легендарная (2%). Множитель статов ×1.00–×1.20, высокие редкости открывают сильные заклинания. Pity: 40 карт без 🟦+ → следующая гарантированно 🟦+.
-• Колода изначально ПУСТАЯ: новые карты попадают в КОЛЛЕКЦИЮ (📚), а в колоду (🃏) вы добавляете их сами (📥). В бой идут первые 7 карт «в колоде».
+• 📜 ТИТУЛЫ: с 3-го уровня в карточке коллекции можно «Даровать титул» (свой текст). Переключатель 🎭 ставит титул ПЕРЕД именем — так карта видна в бою, колодах и коллекции: «Гроза Юга» Пупкин Васильев.
+• Колоды (до 3): новые карты попадают в КОЛЛЕКЦИЮ (📚), а «🃏 Колода» открывается списком всех карт — нажатие на карту кладёт/убирает её из открытой колоды. ⭐Приоритетная колода идёт в бой без вопроса; если не выбрана — бот спросит при старте (одна непустая колода берётся сама). В бой идут первые 7 карт колоды.
 
 ⚔️ <b>Поле боя — 4 клетки и 4 линии</b>
 • Линии сверху вниз: В2 (тыл врага), В1 (фронт врага), С1 (ваш фронт), С2 (ваш тыл). У каждой стороны по 4 клетки, максимум 3 на линию. Раскладки: 3+1, 2+2 или 1+3.
@@ -2556,6 +2699,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • Клик по своему юниту → ДП: Атака / Скрытая атака / 🚶 Перемещение / Защита / Отход / ✨ Магия (у заклинателей). Режимы атаки/перемещения/магии возвращают на поле — следующий клик считается целью (есть «✖ Отменить»; бить союзника нельзя).
 • Скрытая атака всегда спрашивает подтверждение.
 • Клик по пустой клетке → 🚶 переместиться (захват) или 📥 высадить карту из колоды (на своих линиях). Вкладка «🃏 Колода» — внизу.
+• «✨ Магия» внизу карты боя — книга заклинаний прямо с поля: сначала кастер (видно манну 🔮, выносливость ⚡ и известные заклинания), затем заклинание, затем цель.
 • 🌟 При повышении уровня вы САМИ выбираете, какую стату поднять (очки погибших карт тоже можно распределить).
 
 ✨ <b>МАГИЯ (40 заклинаний)</b>
@@ -2679,7 +2823,8 @@ async def msg_collection(m: Message):
 async def msg_deck(m: Message):
     if not await ensure_access_msg(m):
         return
-    text, markup = await battle_deck_screen(m.from_user.id)
+    pref = await user_flag(m.from_user.id, "pref_deck") or 1
+    text, markup = await deck_screen(m.from_user.id, pref, 0)
     await m.answer(text, reply_markup=markup)
 
 
@@ -2738,6 +2883,28 @@ async def msg_catchall(m: Message):
                            reply_markup=admin_kb())
         else:
             await m.answer("❌ Неверный админ-пароль.", reply_markup=KB_MENU)
+        return
+    t_card = await user_flag(uid, "awaiting_title")
+    if t_card:
+        # Ждём текст титула для карты №t_card (кнопка «📜 Даровать титул»)
+        if text.lower() in ("/cancel", "отмена"):
+            await set_user_flag(uid, "awaiting_title", 0)
+            await m.answer("📜 Ввод титула отменён.", reply_markup=KB_MENU)
+            return
+        title = sanitize_title(text)
+        if not title:
+            await m.answer("📜 Титул не может быть пустым (символы «&lt;» «&gt;» «&amp;» "
+                           "не допускаются). Отправьте другой текст или /cancel.")
+            return
+        await db_set_title(int(t_card), title, uid)
+        await set_user_flag(uid, "awaiting_title", 0)
+        row = await db_get_card(int(t_card), uid)
+        if row is None:
+            await m.answer("Карта не найдена — титул не сохранён.", reply_markup=KB_MENU)
+            return
+        await m.answer(f"📜 Титул <b>«{title}»</b> дарован! Использовать его как имя — "
+                       "переключатель 🎭 на карточке.\n\n" + card_text(row),
+                       reply_markup=card_kb(row, "all", "0"))
         return
     await m.answer(MENU_TEXT, reply_markup=KB_MENU)
 
@@ -2837,13 +3004,19 @@ def col_filter_label(f: str) -> str:
 def card_text(row) -> str:
     sub_lbl = "🥷 Скрытность" if row["cls"] == CLS_WARRIOR else "🎯 Точность"
     mana_line = f"\n🔮 Запас манны: {row['mana_max']}" if row["cls"] == CLS_MAGE else ""
-    in_deck_line = ("✅ В колоде — участвует в бою" if row["in_deck"]
-                    else "➖ Вне колоды — бой пропускает")
+    in_deck_line = (f"✅ В колоде №{row['in_deck']} — участвует в бою" if row["in_deck"]
+                    else "➖ Вне колод — бой пропускает")
     rarity = row["rarity"] if "rarity" in row.keys() else "common"
+    ttl = (row.get("title") or "").strip() if hasattr(row, "get") else ""
+    title_line = ""
+    if ttl:
+        title_line = (f"\n📜 Титул: «{ttl}»" +
+                      (" — используется как имя 🎭" if row.get("use_title") else
+                       " (не используется как имя)"))
     return "\n".join([
-        f"🃏 <b>{row['name']} {row['surname']}</b> · #{row['id']}",
+        f"🃏 <b>{disp_name(row)}</b> · #{row['id']}",
         f"{rarity_label(rarity)} · {RACES[row['race']]['emoji']} {row['race']} · {CLS_NAME[row['cls']]}",
-        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}",
+        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}{title_line}",
         "",
         f"⚔️ Атака (АА): {row['attack']}",
         f"❤️ Здоровье: {row['hp']}/{row['hp_max']}",
@@ -2855,51 +3028,68 @@ def card_text(row) -> str:
     ])
 
 
-def card_kb(card_id: int, in_deck: int, ctx: str, page: str) -> InlineKeyboardMarkup:
-    # Кнопки карточки; «Назад» возвращает туда, откуда пришли (ctx+page)
-    toggle = ib("📤 Убрать из колоды" if in_deck else "📥 В колоду", f"dkt:{card_id}:{ctx}:{page}")
-    return kb([toggle],
-              [ib("🗑 Сбросить карту", f"dkd:{card_id}:{ctx}:{page}")],
-              [ib("⬅️ Назад", back_cb(ctx, page))])
+def card_kb(row, ctx: str, page: str) -> InlineKeyboardMarkup:
+    # Кнопки карточки; «Назад» возвращает туда, откуда пришли (ctx+page).
+    # Колода — через выбор одной из DECK_COUNT; титул — с L{TITLE_MIN_LEVEL}.
+    cid = row["id"]
+    cur = f" (сейчас №{row['in_deck']})" if row["in_deck"] else ""
+    rows = [[ib(f"📥 В колоду…{cur}"[:64], f"dks:{cid}:{ctx}:{page}")],
+            [ib("🗑 Сбросить карту", f"dkd:{cid}:{ctx}:{page}")]]
+    ttl = (row.get("title") or "").strip() if hasattr(row, "get") else ""
+    if row["level"] >= TITLE_MIN_LEVEL:
+        if ttl:
+            use = "используется как имя 🎭" if row.get("use_title") else "не используется как имя"
+            rows.append([ib(f"🎭 «{ttl}» — {use}"[:64], f"tu:{cid}:{ctx}:{page}")])
+            rows.append([ib("📜 Сменить титул", f"tt:{cid}:{ctx}:{page}")])
+        else:
+            rows.append([ib("📜 Даровать титул", f"tt:{cid}:{ctx}:{page}")])
+    rows.append([ib("⬅️ Назад", back_cb(ctx, page))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_cb(ctx: str, page: str) -> str:
-    # Куда ведёт «Назад»: dk — боевая колода, иначе коллекция с фильтром
-    return "dk:0" if ctx == "dk" else f"col:{ctx}:{page}"
+    # Куда ведёт «Назад»: dk — колоды, иначе коллекция с фильтром~сортировкой
+    return "dk:1:0" if ctx == "dk" else f"col:{ctx}:{page}"
 
 
 async def ctx_screen(user_id: int, ctx: str, page: str):
     # Экран по контексту возврата
     if ctx == "dk":
-        return await battle_deck_screen(user_id)
+        return await deck_screen(user_id, 1, 0)
     return await collection_screen(user_id, ctx, int(page) if page.isdigit() else 0)
 
 
 async def collection_screen(user_id: int, f: str, page: int):
-    # «📚 Коллекция» — ВСЕ карты игрока с фильтром и пагинацией
+    # «📚 Коллекция» — ВСЕ карты игрока с фильтром, сортировкой и пагинацией.
+    # f = «<фильтр>» или «<фильтр>~<код_сортировки>» (коды — SORTS,
+    # «-» на конце = по убыванию; пусто = 📅 дата получения, как раньше).
+    flt, _, srt = f.partition("~")
+    srt = srt or "id"
     cards = await db_user_cards(user_id)
     if not cards:
         return ("📚 <b>Коллекция пуста.</b>\n\nПолучите первую карту!",
                 kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
-    in_deck_n = sum(c["in_deck"] for c in cards)
-    filt = col_filter_cards(cards, f)
+    deck_counts = [sum(1 for c in cards if c["in_deck"] == n)
+                   for n in range(1, DECK_COUNT + 1)]
+    in_deck_n = sum(deck_counts)
+    decks_line = " ".join(f"{n}️⃣{deck_counts[n - 1]}" for n in range(1, DECK_COUNT + 1))
+    filt = sort_cards(col_filter_cards(cards, flt), srt)
     if not filt:
-        return (f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колоде: {in_deck_n}\n\n"
-                f"Под фильтром «{col_filter_label(f)}» карт нет.",
-                kb([ib("🧾 Сбросить фильтр", f"col:all:{page}")], [ib("🏠 Меню", "mn:home")]))
+        return (f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колодах: {in_deck_n} ({decks_line})\n\n"
+                f"Под фильтром «{col_filter_label(flt)}» карт нет.",
+                kb([ib("🧾 Сбросить фильтр", f"col:all~{srt}:{page}")], [ib("🏠 Меню", "mn:home")]))
     n_pages = (len(filt) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
     page = max(0, min(page, n_pages - 1))
     chunk = filt[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]
-    lines = [f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колоде: {in_deck_n}",
-             f"Фильтр: {col_filter_label(f)} · показано {len(filt)}",
-             f"В бой идут первые {MAX_DECK} карт «в колоде».", ""]
+    lines = [f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колодах: {in_deck_n} ({decks_line})",
+             f"Фильтр: {col_filter_label(flt)} · Сортировка: {sort_label(srt)} · показано {len(filt)}",
+             f"В бой идут первые {MAX_DECK} карт каждой колоды.", ""]
     rows = []
     for c in chunk:
-        mark = "✅" if c["in_deck"] else "➖"
-        rem = rarity_label(c["rarity"] if "rarity" in c.keys() else "common").split(" ")[0]
-        lines.append(f"{mark} {rem}{CLS_EMOJI[c['cls']]} <b>{c['name']} {c['surname']}</b> · {c['race']} · L{c['level']}")
-        rows.append([ib(f"{rem}{CLS_EMOJI[c['cls']]} {c['name']} {c['surname']} · L{c['level']}",
-                        f"card:{c['id']}:{f}:{page}")])
+        mark = f"✅{c['in_deck']}" if c["in_deck"] else "➖"
+        line = card_line(c)
+        lines.append(f"{mark} {line}")
+        rows.append([ib(f"{mark} {line}"[:64], f"card:{c['id']}:{f}:{page}")])
     nav = []
     if page > 0:
         nav.append(ib("◀️", f"col:{f}:{page - 1}"))
@@ -2907,32 +3097,66 @@ async def collection_screen(user_id: int, f: str, page: int):
     if page < n_pages - 1:
         nav.append(ib("▶️", f"col:{f}:{page + 1}"))
     rows.append(nav)
-    rows.append([ib(label, f"col:{code}:{page}") for code, label in COL_FILTERS[:3]])
-    rows.append([ib(label, f"col:{code}:{page}") for code, label in COL_FILTERS[3:]] +
-                [ib("🎭 Раса", "colr"), ib("✨ Редк.", "colq")])
-    rows.append([ib("🃏 Боевая колода", "dk:0"), ib("🏠 Меню", "mn:home")])
+    rows.append([ib(label, f"col:{code}~{srt}:{page}") for code, label in COL_FILTERS[:3]])
+    rows.append([ib(label, f"col:{code}~{srt}:{page}") for code, label in COL_FILTERS[3:]] +
+                [ib("🎭 Раса", f"colr:{f}"), ib("✨ Редк.", f"colq:{f}")])
+    rows.append([ib("🔃 Сортировка", f"srt:{f}:{page}"),
+                 ib("🃏 Колоды", "dk:1:0"), ib("🏠 Меню", "mn:home")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def battle_deck_screen(user_id: int):
-    # «🃏 Колода» — боевой набор: какие карты пойдут в сражение
+async def deck_screen(user_id: int, deck: int = 1, page: int = 0):
+    # «🃏 Колоды» — до DECK_COUNT колод. Открывается как коллекция:
+    # список ВСЕХ карт с пагинацией; тык на карту = положить/убрать
+    # из текущей колоды (если карта была в другой колоде — перенесётся).
+    # Состав текущей колоды выводится в тексте сообщения построчно.
+    # ⭐ Приоритетная колода идёт в бой без вопроса при старте.
+    deck = max(1, min(int(deck), DECK_COUNT))
     cards = await db_user_cards(user_id)
-    deck = [c for c in cards if c["in_deck"]]
-    if not deck:
-        return ("🃏 <b>Боевая колода пуста.</b>\n\nДобавьте карты из коллекции "
-                "(кнопка «📥 В колоду» на карточке) — в бой пойдут первые "
-                f"{MAX_DECK}.",
-                kb([ib("📚 Коллекция", "col:all:0")], [ib("🏠 Меню", "mn:home")]))
-    warn = (f"\n⚠️ Карт больше {MAX_DECK} — в бой пойдут только первые {MAX_DECK} (⚔️)."
-            if len(deck) > MAX_DECK else "")
-    lines = [f"🃏 <b>Боевая колода</b>: {len(deck)} карт{warn}", ""]
+    if not cards:
+        return ("🃏 <b>Карт пока нет.</b>\n\nПолучите первую карту — и добавьте её в колоду.",
+                kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
+    pref = await user_flag(user_id, "pref_deck")
+    decks = decks_of(cards)
+    in_deck = decks[deck]
+    star = " · ⭐ приоритетная" if pref == deck else ""
+    lines = [f"🃏 <b>Колода №{deck}</b>: {len(in_deck)} карт{star}", ""]
+    if in_deck:
+        if len(in_deck) > MAX_DECK:
+            lines.append(f"⚠️ Карт больше {MAX_DECK} — в бой пойдут только первые {MAX_DECK} (⚔️).")
+        for i, c in enumerate(in_deck):
+            mark = "⚔️" if i < MAX_DECK else "▪️"
+            lines.append(f"{mark} {card_line(c)}")
+    else:
+        lines.append("Колода пуста — нажмите на карты в списке ниже, чтобы добавить их.")
+    lines += ["", f"<b>Все карты</b> (нажатие = в колоду №{deck} / из колоды):"]
     rows = []
-    for i, c in enumerate(deck):
-        mark = "⚔️" if i < MAX_DECK else "▪️"
-        lines.append(f"{mark} {CLS_EMOJI[c['cls']]} <b>{c['name']} {c['surname']}</b> · L{c['level']}")
-        rows.append([ib(f"{CLS_EMOJI[c['cls']]} {c['name']} {c['surname']} · L{c['level']}",
-                        f"card:{c['id']}:dk:0")])
-    rows.append([ib("📚 Добавить из коллекции", "col:all:0"), ib("🏠 Меню", "mn:home")])
+    tabs = []
+    for n in range(1, DECK_COUNT + 1):
+        cur = "🔹" if n == deck else ""
+        star_n = "⭐" if pref == n else ""
+        tabs.append(ib(f"{cur}{n}️⃣{star_n}·{len(decks[n])}", f"dk:{n}:0"))
+    rows.append(tabs)
+    rows.append([ib("⭐ Сделать приоритетной" if pref != deck else "⭐ Убрать приоритет",
+                    f"pdk:{deck}")])
+    n_pages = max(1, (len(cards) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+    page = max(0, min(int(page), n_pages - 1))
+    for c in cards[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]:
+        if c["in_deck"] == deck:
+            mark = "✅"
+        elif c["in_deck"]:
+            mark = f"🔸{c['in_deck']}"     # карта лежит в другой колоде
+        else:
+            mark = "➖"
+        rows.append([ib(f"{mark} {card_line(c)}"[:64], f"dkg:{c['id']}:{deck}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️", f"dk:{deck}:{page - 1}"))
+    if page < n_pages - 1:
+        nav.append(ib("▶️", f"dk:{deck}:{page + 1}"))
+    nav.append(ib("📚 Коллекция", "col:all:0"))
+    nav.append(ib("🏠 Меню", "mn:home"))
+    rows.append(nav)
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2944,32 +3168,122 @@ async def cb_collection(call: CallbackQuery):
     await safe_edit(call, text, markup)
 
 
-@router.callback_query(F.data == "colr")
+@router.callback_query(F.data.startswith("colr"))
 async def cb_collection_races(call: CallbackQuery):
-    # Выбор фильтра по расе
+    # Выбор фильтра по расе (текущий фильтр~сортировка едут в «colr:{f}»)
+    parts = call.data.split(":", 1)
+    f = parts[1] if len(parts) > 1 else "all"
+    _, _, srt = f.partition("~")
+    srt = srt or "id"
     rows = []
     for i, race in enumerate(RACE_KEYS):
-        rows.append([ib(f"{RACES[race]['emoji']} {race}", f"col:r{i}:0")])
-    rows.append([ib("🧾 Все карты", "col:all:0")])
+        rows.append([ib(f"{RACES[race]['emoji']} {race}", f"col:r{i}~{srt}:0")])
+    rows.append([ib("🧾 Все карты", f"col:all~{srt}:0")])
     await safe_answer(call)
     await safe_edit(call, "🎭 <b>Коллекция — фильтр по расе:</b>",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
 
-@router.callback_query(F.data == "colq")
+@router.callback_query(F.data.startswith("colq"))
 async def cb_collection_rarities(call: CallbackQuery):
-    # Выбор фильтра по редкости
-    rows = [[ib(rarity_label(k), f"col:q{i}:0")] for i, k in enumerate(RARITY_KEYS)]
-    rows.append([ib("🧾 Все карты", "col:all:0")])
+    # Выбор фильтра по редкости (сортировка сохраняется)
+    parts = call.data.split(":", 1)
+    f = parts[1] if len(parts) > 1 else "all"
+    _, _, srt = f.partition("~")
+    srt = srt or "id"
+    rows = [[ib(rarity_label(k), f"col:q{i}~{srt}:0")] for i, k in enumerate(RARITY_KEYS)]
+    rows.append([ib("🧾 Все карты", f"col:all~{srt}:0")])
     await safe_answer(call)
     await safe_edit(call, "✨ <b>Коллекция — фильтр по редкости:</b>",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
 
+@router.callback_query(F.data.startswith("srt:"))
+async def cb_sort_menu(call: CallbackQuery):
+    # Меню критериев сортировки коллекции
+    _, f, page = call.data.split(":")
+    _, _, srt = f.partition("~")
+    srt = srt or "id"
+    cur = srt[:-1] if srt.endswith("-") else srt
+    rows = []
+    for code, label in SORTS:
+        mark = (" 🔽" if srt.endswith("-") else " 🔼") if code == cur else ""
+        rows.append([ib(f"{label}{mark}", f"srs:{code}:{f}:{page}")])
+    rows.append([ib("⬅️ Назад к коллекции", f"col:{f}:{page}")])
+    await safe_answer(call)
+    await safe_edit(call, "🔃 <b>Сортировка коллекции</b>\n\nПервое нажатие на критерий — "
+                          "по возрастанию (🔼), повторное нажатие на текущий — "
+                          "по убыванию (🔽).",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("srs:"))
+async def cb_sort_pick(call: CallbackQuery):
+    # Выбран критерий: тот же — меняет направление, новый — по возрастанию
+    _, code, f, page = call.data.split(":")
+    flt, _, srt = f.partition("~")
+    srt = srt or "id"
+    if srt == code:
+        new = code + "-"          # возрастание → убывание
+    elif srt == code + "-":
+        new = code                # убывание → снова возрастание
+    else:
+        new = code
+    text, markup = await collection_screen(call.from_user.id, f"{flt}~{new}",
+                                           int(page) if page.isdigit() else 0)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
 @router.callback_query(F.data.startswith("dk:"))
 async def cb_deck(call: CallbackQuery):
-    text, markup = await battle_deck_screen(call.from_user.id)
+    # «🃏 Колоды»: dk:{номер}:{страница}. Старый формат «dk:0» → колода №1.
+    parts = call.data.split(":")
+    deck = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 1
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    text, markup = await deck_screen(call.from_user.id, deck, page)
     await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("pdk:"))
+async def cb_pref_deck(call: CallbackQuery):
+    # ⭐ Приоритетная колода: с ней бой стартует без вопроса «какая колода?»
+    n = int(call.data.split(":")[1])
+    uid = call.from_user.id
+    cur = await user_flag(uid, "pref_deck")
+    new = 0 if cur == n else n
+    await set_user_flag(uid, "pref_deck", new)
+    text, markup = await deck_screen(uid, n, 0)
+    await safe_answer(call, "Приоритет убран" if new == 0 else f"Колода №{n} — приоритетная ⭐")
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("dkg:"))
+async def cb_deck_grid_toggle(call: CallbackQuery):
+    # Тык на карту в списке колод: положить в текущую / убрать
+    # (если была в другой колоде — переносится в текущую).
+    _, cid_s, deck_s, page_s = call.data.split(":")
+    cid, deck, page = int(cid_s), int(deck_s), int(page_s)
+    row = await db_get_card(cid, call.from_user.id)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if row["in_deck"] == deck:
+        await db_set_in_deck(cid, 0)
+        msg = f"Убрано из колоды №{deck}"
+    else:
+        if DECK_LIMIT_ENABLED:
+            cards = await db_user_cards(call.from_user.id)
+            if sum(1 for c in cards if c["in_deck"] == deck) >= MAX_DECK:
+                await safe_answer(call, f"В колоде №{deck} уже {MAX_DECK} карт!",
+                                  show_alert=True)
+                return
+        await db_set_in_deck(cid, deck)
+        msg = (f"Добавлено в колоду №{deck}" if not row["in_deck"]
+               else f"Перенесено из колоды №{row['in_deck']} в №{deck}")
+    await safe_answer(call, msg)
+    text, markup = await deck_screen(call.from_user.id, deck, page)
     await safe_edit(call, text, markup)
 
 
@@ -2982,11 +3296,108 @@ async def cb_card(call: CallbackQuery):
     if not row:
         await safe_edit(call, "Карта не найдена.", kb([ib("⬅️ Назад", back_cb(ctx, page))]))
         return
-    await safe_edit(call, card_text(row), card_kb(row["id"], row["in_deck"], ctx, page))
+    await safe_edit(call, card_text(row), card_kb(row, ctx, page))
+
+
+@router.callback_query(F.data.startswith("dks:"))
+async def cb_deck_picker(call: CallbackQuery):
+    # «📥 В колоду…» — в какую из колод положить карту (или убрать)
+    _, cid, ctx, page = call.data.split(":")
+    row = await db_get_card(int(cid), call.from_user.id)
+    await safe_answer(call)
+    if not row:
+        await safe_edit(call, "Карта не найдена.", kb([ib("⬅️ Назад", back_cb(ctx, page))]))
+        return
+    rows = []
+    for n in range(1, DECK_COUNT + 1):
+        mark = " ✅" if row["in_deck"] == n else ""
+        rows.append([ib(f"🃏 Колода №{n}{mark}", f"dka:{cid}:{n}:{ctx}:{page}")])
+    if row["in_deck"]:
+        rows.append([ib("📤 Убрать из колоды", f"dka:{cid}:0:{ctx}:{page}")])
+    rows.append([ib("⬅️ Назад", f"card:{cid}:{ctx}:{page}")])
+    await safe_edit(call, f"📥 В какую колоду положить «{disp_name(row)}»?",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("dka:"))
+async def cb_deck_apply(call: CallbackQuery):
+    # Положить карту в колоду №n (0 = убрать из колод)
+    _, cid, n, ctx, page = call.data.split(":")
+    cid_i, n_i = int(cid), int(n)
+    row = await db_get_card(cid_i, call.from_user.id)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if n_i > 0 and DECK_LIMIT_ENABLED and row["in_deck"] != n_i:
+        cards = await db_user_cards(call.from_user.id)
+        if sum(1 for c in cards if c["in_deck"] == n_i) >= MAX_DECK:
+            await safe_answer(call, f"В колоде №{n_i} не может быть больше {MAX_DECK} карт!",
+                              show_alert=True)
+            return
+    await db_set_in_deck(cid_i, n_i)
+    row = await db_get_card(cid_i, call.from_user.id)
+    await safe_answer(call, "Убрано из колоды" if n_i == 0 else f"В колоде №{n_i}")
+    await safe_edit(call, card_text(row), card_kb(row, ctx, page))
+
+
+@router.callback_query(F.data.startswith("ttc:"))
+async def cb_title_cancel(call: CallbackQuery):
+    # «⬅️ Отменить» на экране ввода титула — сбрасываем ожидание
+    _, cid, ctx, page = call.data.split(":")
+    await set_user_flag(call.from_user.id, "awaiting_title", 0)
+    row = await db_get_card(int(cid), call.from_user.id)
+    await safe_answer(call, "Ввод титула отменён")
+    if row:
+        await safe_edit(call, card_text(row), card_kb(row, ctx, page))
+    else:
+        text, markup = await ctx_screen(call.from_user.id, ctx, page)
+        await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("tt:"))
+async def cb_title_ask(call: CallbackQuery):
+    # «📜 Даровать титул» (карта L3+): ждём текст титула обычным сообщением.
+    # Состояние — в users.awaiting_title (id карты), как у паролей (без FSM).
+    _, cid, ctx, page = call.data.split(":")
+    row = await db_get_card(int(cid), call.from_user.id)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if row["level"] < TITLE_MIN_LEVEL:
+        await safe_answer(call, f"Титул даруется с {TITLE_MIN_LEVEL}-го уровня "
+                                f"(у карты сейчас L{row['level']}).", show_alert=True)
+        return
+    await set_user_flag(call.from_user.id, "awaiting_title", int(cid))
+    await safe_answer(call)
+    await safe_edit(call, f"📜 <b>Дарование титула</b> · {disp_name(row)}\n\n"
+                          "Отправьте титул обычным сообщением (до 32 символов; "
+                          "символы «&lt;» «&gt;» «&amp;» будут вырезаны).\n"
+                          "Для отмены отправьте /cancel.",
+                    kb([ib("⬅️ Отменить", f"ttc:{cid}:{ctx}:{page}")]))
+
+
+@router.callback_query(F.data.startswith("tu:"))
+async def cb_title_use(call: CallbackQuery):
+    # 🎭 Вкл/выкл «титул как имя» (бой, колоды, коллекция)
+    _, cid, ctx, page = call.data.split(":")
+    row = await db_get_card(int(cid), call.from_user.id)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if not ((row.get("title") or "").strip() if hasattr(row, "get") else ""):
+        await safe_answer(call, "Сначала даруйте карте титул.", show_alert=True)
+        return
+    new = 0 if row.get("use_title") else 1
+    await db_set_use_title(int(cid), new, call.from_user.id)
+    row = await db_get_card(int(cid), call.from_user.id)
+    await safe_answer(call)
+    await safe_edit(call, card_text(row), card_kb(row, ctx, page))
 
 
 @router.callback_query(F.data.startswith("dkt:"))
 async def cb_toggle_deck(call: CallbackQuery):
+    # Устаревший колбэк старых сообщений: быстрый тумблер колоды №1.
+    # Новые экраны используют dks:/dka:/dkg:.
     parts = call.data.split(":")
     cid, ctx, page = parts[1], parts[2], parts[3] if len(parts) > 3 else "0"
     row = await db_get_card(int(cid), call.from_user.id)
@@ -2999,13 +3410,13 @@ async def cb_toggle_deck(call: CallbackQuery):
     else:
         if DECK_LIMIT_ENABLED:
             cards = await db_user_cards(call.from_user.id)
-            if sum(c["in_deck"] for c in cards) >= MAX_DECK:
+            if sum(1 for c in cards if c["in_deck"] == 1) >= MAX_DECK:
                 await safe_answer(call, f"В колоде не может быть больше {MAX_DECK} карт!", show_alert=True)
                 return
         await db_set_in_deck(row["id"], 1)
-        await safe_answer(call, "Добавлено в колоду")
+        await safe_answer(call, "Добавлено в колоду №1")
     row = await db_get_card(int(cid), call.from_user.id)
-    await safe_edit(call, card_text(row), card_kb(row["id"], row["in_deck"], ctx, page))
+    await safe_edit(call, card_text(row), card_kb(row, ctx, page))
 
 
 @router.callback_query(F.data.startswith("dkd:"))
@@ -3076,10 +3487,11 @@ async def get_new_card(user_id: int):
         fanf = "🎲 <b>Новая карта получена!</b>\n\n"
     text = (fanf + card_text(row) +
             f"\n\n🍀 Pity: {pity}/{PITY_THRESHOLD} до гарантированной 🟦 Редкой."
-            "\n💡 Колода изначально пуста — добавляйте в неё карты сами "
-            "(кнопка «📥 В колоду»), именно они пойдут в бой.")
+            "\n💡 Колоды пусты — откройте «🃏 Колода» и нажмите на карты, "
+            "которые возьмёте в бой (колод до 3).")
     markup = kb([ib("🎲 Ещё одну", "getc")],
-                [ib("📚 Коллекция", "col:all:0"), ib("🏠 Меню", "mn:home")])
+                [ib("🃏 Колода", "dk:1:0"), ib("📚 Коллекция", "col:all:0")],
+                [ib("🏠 Меню", "mn:home")])
     return text, markup
 
 
@@ -3094,38 +3506,69 @@ async def cb_get_card(call: CallbackQuery):
 # ХЕНДЛЕРЫ: бой — подготовка, старт, завершение
 # =====================================================================
 
-async def battle_setup_screen(user_id: int):
-    # Экран подготовки к бою: сколько карт в колоде + выбор раскладки из 4 клеток
-    battle_cards = await db_battle_cards(user_id)
-    if not battle_cards:
-        all_cards = await db_user_cards(user_id)
-        if not all_cards:
-            return ("⚔️ <b>У вас пока нет карт!</b>\n\nПолучите первую карту — "
-                    "и не забудьте добавить её в колоду.",
-                    kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
-        return ("⚔️ <b>Колода пуста!</b>\n\nКолоду вы собираете сами: откройте «🃏 Колода», "
-                "выберите карту и нажмите «📥 В колоду». В бой пойдут первые "
-                f"{MAX_DECK} добавленных.",
-                kb([ib("📚 Открыть коллекцию", "col:all:0")], [ib("🏠 Меню", "mn:home")]))
+async def battle_setup_screen(user_id: int, deck: int = 0, force_pick: bool = False):
+    # Экран подготовки к бою. Колод теперь до DECK_COUNT:
+    #  • колода передана явно (deck>0) — сразу выбор раскладки;
+    #  • не передана — берём ⭐приоритетную; если её нет и колода одна —
+    #    берём её без вопросов; иначе спрашиваем, какая колода идёт в бой.
     all_cards = await db_user_cards(user_id)
-    in_deck_total = sum(c["in_deck"] for c in all_cards)
+    if not all_cards:
+        return ("⚔️ <b>У вас пока нет карт!</b>\n\nПолучите первую карту — "
+                "и не забудьте добавить её в колоду.",
+                kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
+    decks = decks_of(all_cards)
+    non_empty = [n for n in sorted(decks) if decks[n]]
+    if not non_empty:
+        return ("⚔️ <b>Все колоды пусты!</b>\n\nОткройте «🃏 Колода» и нажмите на карты, "
+                "которые возьмёте в бой.",
+                kb([ib("🃏 Колоды", "dk:1:0")], [ib("🏠 Меню", "mn:home")]))
+    if deck <= 0 and not force_pick:
+        pref = await user_flag(user_id, "pref_deck")
+        if pref in non_empty:
+            deck = pref
+        elif len(non_empty) == 1:
+            deck = non_empty[0]
+    if deck <= 0:
+        # Колода не определена — спрашиваем каждый раз (или по «🔁 Другая колода»)
+        rows = [[ib(f"🃏 Колода №{n} — {len(decks[n])} карт", f"bds:{n}")] for n in non_empty]
+        rows.append([ib("🏠 Меню", "mn:home")])
+        return ("⚔️ <b>Подготовка к бою</b>\n\nКакая колода идёт в бой? "
+                "(Чтобы не спрашивал каждый раз — отметь колоду ⭐ в «🃏 Колода».)",
+                InlineKeyboardMarkup(inline_keyboard=rows))
+    cards = decks[deck]
+    battle_cards = cards[:MAX_DECK]
     note = (f"\n⚠️ В колоде больше {MAX_DECK} карт — в бой пойдут первые {MAX_DECK}."
-            if in_deck_total > MAX_DECK else "")
-    text = (f"⚔️ <b>Подготовка к бою</b>\n\nКарт в колоде: {len(battle_cards)}.{note}\n\n"
+            if len(cards) > MAX_DECK else "")
+    text = (f"⚔️ <b>Подготовка к бою</b> · колода №{deck}\n\n"
+            f"Карт в бою: {len(battle_cards)}.{note}\n\n"
             "Выберите расстановку (<b>всего 4 клетки</b>, максимум 3 на линию, обе линии обязательны):\n"
             "• <b>3 фронта / 1 тыл</b> — фронт 1,2,3; тыл 2\n"
             "• <b>2 фронта / 2 тыла</b> — обе линии: 1 и 3\n"
             "• <b>1 фронт / 3 тыла</b> — фронт 2; тыл 1,2,3")
-    markup = kb([ib("🛡 3 фронта / 1 тыл", "bl:31")],
-                [ib("⚖️ 2 фронта / 2 тыла", "bl:22")],
-                [ib("🏹 1 фронт / 3 тыла", "bl:13")],
-                [ib("🏠 Меню", "mn:home")])
-    return text, markup
+    rows = [[ib("🛡 3 фронта / 1 тыл", f"bl:31:{deck}")],
+            [ib("⚖️ 2 фронта / 2 тыла", f"bl:22:{deck}")],
+            [ib("🏹 1 фронт / 3 тыла", f"bl:13:{deck}")]]
+    if len(non_empty) > 1:
+        rows.append([ib("🔁 Другая колода", "bds:0")])
+    rows.append([ib("🏠 Меню", "mn:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("bds:"))
+async def cb_battle_deck_select(call: CallbackQuery):
+    # Выбор колоды перед боем (bds:0 = «🔁 Другая колода» → снова список)
+    n = int(call.data.split(":")[1])
+    text, markup = await battle_setup_screen(call.from_user.id, n, force_pick=(n == 0))
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
 
 
 @router.callback_query(F.data.startswith("bl:"))
 async def cb_battle_start(call: CallbackQuery):
-    layout_key = call.data.split(":")[1]
+    parts = call.data.split(":")
+    layout_key = parts[1]
+    # Старые кнопки «bl:31» (без колоды) → колода №1
+    deck = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
     user_id = call.from_user.id
     if layout_key not in LAYOUTS:
         await safe_answer(call, "Неизвестная раскладка.", show_alert=True)
@@ -3133,12 +3576,13 @@ async def cb_battle_start(call: CallbackQuery):
     if await db_load_battle(user_id):
         await safe_answer(call, "У вас уже идёт бой!", show_alert=True)
         return
-    cards = await db_battle_cards(user_id)
+    cards = await db_battle_cards(user_id, deck)
     if not cards:
-        await safe_answer(call, "Колода пуста! Добавьте карты в колоду в коллекции.", show_alert=True)
+        await safe_answer(call, "Колода пуста! Добавьте карты: «🃏 Колода».", show_alert=True)
         return
     state = create_battle(cards, layout_key)
-    log_add(state, "⚔️ Бой начался! Нажмите на клетку поля, чтобы действовать. Удачи!")
+    log_add(state, f"⚔️ Бой начался (колода №{deck})! Нажмите на клетку поля, "
+                   "чтобы действовать. Удачи!")
     await db_save_battle(user_id, state)
     await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
@@ -3493,8 +3937,7 @@ async def show_cards_for_cell(call: CallbackQuery, state: dict, line: str, pos: 
             f"(высадка не тратит выносливость):")
     rows = []
     for u in state["player"]["deck"]:
-        rows.append([ib(f"{CLS_EMOJI[u['cls']]} {u['name']} L{u['level']} ⚡{u['end']}",
-                        f"PC:{line}:{pos}:{u['uid']}")])
+        rows.append([ib(unit_line(u)[:64], f"PC:{line}:{pos}:{u['uid']}")])
     rows.append([ib("✖ Отменить", "X")])
     await safe_answer(call)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
@@ -3647,6 +4090,40 @@ async def cb_unit_menu_back(call: CallbackQuery):
     if u is None:
         return
     await show_unit_menu(call, state, u)
+
+
+@router.callback_query(F.data == "SB")
+async def cb_spellbook(call: CallbackQuery):
+    # «✨ Магия» с основной карты боя: сначала выбор КАСТЕРА (у каждого
+    # видны манна, выносливость и известные заклинания), затем книга
+    # выбранного мага (SP:) и выбор цели (SPL: — как раньше).
+    state = await load_active_battle(call)
+    if not state:
+        return
+    casters = [u for _, _, u in board_units(state, "player") if u["cls"] == CLS_MAGE]
+    if not casters:
+        await safe_answer(call, "На поле нет заклинателей 🔮 — сначала высадите "
+                                "мага из колоды (клетка на своей линии).", show_alert=True)
+        return
+    lines = ["✨ <b>Книга заклинаний</b> — выберите кастера:", ""]
+    rows = []
+    for u in casters:
+        known = known_spells(u)
+        fl = unit_flags(u)
+        lines.append(f"• {ROW_LABEL[u['line']]}:{u['pos']} <b>{u['name']} {u['surname']}</b> "
+                     f"L{u['level']} — 🔮 {u['mana']}/{u['mana_max']}, ⚡ {u['end']}/{u['end_max']}"
+                     + (f" {fl}" if fl else ""))
+        if known:
+            lines.append("  знает: " + " · ".join(
+                f"{SPELLS[s]['emoji']} {SPELLS[s]['name']}" + ("" if spell_available(u, SPELLS[s]) else " 🔒")
+                for s in known))
+        else:
+            lines.append("  заклинаний пока не знает (открываются с уровнем/редкостью).")
+        rows.append([ib(f"🔮 {u['name']} · 🔮{u['mana']} ⚡{u['end']} · ✨{len(known)}",
+                        f"SP:{u['uid']}")])
+    rows.append([ib("⬅️ Назад на поле", "bt:view")])
+    await safe_answer(call)
+    await safe_edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(F.data.startswith("SP:"))
@@ -3991,9 +4468,7 @@ async def cb_deck_tab(call: CallbackQuery):
                                  "+1⚡ и +1🔮 каждый ход. Нажмите карту, чтобы выставить на поле:")
     rows = []
     for u in deck:
-        mana = f" 🔮{u['mana']}/{u['mana_max']}" if u["cls"] == CLS_MAGE else ""
-        rows.append([ib(f"{CLS_EMOJI[u['cls']]} {u['name']} L{u['level']} ❤{u['hp']} "
-                        f"⚡{u['end']}/{u['end_max']}{mana}", f"DKP:{u['uid']}")])
+        rows.append([ib(unit_line(u)[:64], f"DKP:{u['uid']}")])
     if not deck:
         text += "\n\n(пусто)"
     rows.append([ib("⬅️ Назад на поле", "bt:view")])
@@ -4212,11 +4687,15 @@ async def admin_card_list(call: CallbackQuery, op: str, page: int):
 
 
 async def run_battle_sims(user_id: int, n: int):
-    # Прогон N боёв: колода игрока (первые MAX_DECK карт «в колоде») против
-    # сгенерированной колоды АНАЛОГИЧНОЙ РЕДКОСТИ (средний ранг редкости и
-    # средний уровень колоды игрока). Оба игрока — движковый ИИ.
-    # Возвращает (summary, full_log) или (None, None), если колода пуста.
-    bcards = await db_battle_cards(user_id)
+    # Прогон N боёв: колода игрока против сгенерированной колоды АНАЛОГИЧНОЙ
+    # РЕДКОСТИ (средний ранг редкости и средний уровень колоды игрока).
+    # Оба игрока — движковый ИИ. Колода: ⭐приоритетная, иначе первая
+    # непустая (№1→№2→№3). Возвращает (summary, full_log) или (None, None).
+    all_cards = await db_user_cards(user_id)
+    decks = decks_of(all_cards)
+    pref = await user_flag(user_id, "pref_deck")
+    deck = pref if decks.get(pref) else next((d for d in sorted(decks) if decks[d]), 1)
+    bcards = await db_battle_cards(user_id, deck)
     if not bcards:
         return None, None
     n = max(1, min(n, SIM_MAX_BATTLES))
@@ -4231,7 +4710,7 @@ async def run_battle_sims(user_id: int, n: int):
     spells_cast = 0
     full_log = [
         "⚔️ ПРОГОН БОЁВ (админ-панель)",
-        f"Боёв: {n} · Колода игрока: {deck_desc}",
+        f"Боёв: {n} · Колода игрока №{deck}: {deck_desc}",
         f"Противник: колода аналогичной редкости ({rarity_label(enemy_rarity)}), средний уровень {avg_level}",
         "",
     ]
@@ -4264,7 +4743,7 @@ async def run_battle_sims(user_id: int, n: int):
         battle_log.append(f"--- ИТОГ БОЯ {i + 1}: {res.upper()}, раундов: {state['round']} ---")
         full_log += battle_log + [""]
     winrate = results["victory"] * 100 // max(1, n)
-    summary = (f"⚔️ <b>Прогон: {n} боёв</b>\n"
+    summary = (f"⚔️ <b>Прогон: {n} боёв</b> · колода №{deck}\n"
                f"🏆 Побед: {results['victory']} ({winrate}%) · ☠️ Поражений: {results['defeat']} · "
                f"🤝 Ничьих: {results['draw']}\n"
                f"⏱ Средняя длина боя: {rounds_total // max(1, n)} раундов · "
