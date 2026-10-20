@@ -2757,8 +2757,17 @@ async def safe_edit(call: CallbackQuery, text: str, markup=None):
         markup = InlineKeyboardMarkup(inline_keyboard=[])
     try:
         await call.message.edit_text(text, reply_markup=markup)
-    except TelegramBadRequest:
-        pass
+    except TelegramBadRequest as e:
+        # Если Telegram не смог разобрать HTML-разметку (например, в текст
+        # попал голый «<» или «&»), повторяем отправку БЕЗ parse_mode —
+        # пользователь увидит простой текст вместо «залипшего» экрана.
+        if "can't parse entities" in str(e):
+            try:
+                await call.message.edit_text(text, reply_markup=markup,
+                                             parse_mode=None)
+            except TelegramBadRequest:
+                pass
+        # Остальные ошибки (сообщение не изменилось и т.п.) — игнорируем.
 
 
 # =====================================================================
@@ -4140,7 +4149,7 @@ def admin_text() -> str:
             "✨ Редкость — изменить грейд карты\n"
             "🗑 Удалить карту\n"
             "❤️ Вылечить все карты\n"
-            f"⚔️ Прогон боёв — N боёв (N < 50) вашей колодой против колоды "
+            f"⚔️ Прогон боёв — N боёв (N &lt; 50) вашей колодой против колоды "
             f"аналогичной редкости; полный лог ходов придёт файлом.")
 
 
