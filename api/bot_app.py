@@ -183,11 +183,12 @@ def disp_name(x, surname: bool = True) -> str:
 
 
 def main_stat(cls: str, attack: int, armor: int):
-    # Главная цифра карты: у воинов — что БОЛЬШЕ из атаки/защиты,
-    # у заклинателей — всегда атака. Возвращает (значок, число).
+    # Доминирующая стата (уточнение заказчика): у воинов — ПОБЕДИТЕЛЬ
+    # сравнения «Атака vs Защита, делённая ЦЕЛО на два» (attack >= armor//2
+    # → атака); у заклинателей — всегда атака. Возвращает (значок, число).
     if cls == CLS_MAGE:
         return "⚔", attack
-    return ("⚔", attack) if attack >= armor else ("🛡", armor)
+    return ("⚔", attack) if attack >= armor // 2 else ("🛡", armor)
 
 
 def card_line(c) -> str:
@@ -201,6 +202,17 @@ def card_line(c) -> str:
     else:
         res = f"❤{c['hp']}" if c["hp"] >= c["hp_max"] else f"❤{c['hp']}/{c['hp_max']}"
     return f"{CLS_EMOJI[c['cls']]}{rem} L{c['level']} {disp_name(c)} {ico}{val} {res}"
+
+
+def card_full_line(c) -> str:
+    # Карта СО ВСЕМИ статами одной строкой — для ТЕКСТА сообщений в
+    # списках колод и коллекции (кнопки остаются компактными — card_line).
+    rem = rarity_label(c.get("rarity") or "common").split(" ")[0]
+    sub_e = "🥷" if c["cls"] == CLS_WARRIOR else "🎯"
+    mana = f" · 🔮{c['mana_max']}" if c["cls"] == CLS_MAGE else ""
+    return (f"{CLS_EMOJI[c['cls']]}{rem} L{c['level']} {disp_name(c)} · "
+            f"⚔{c['attack']} · 🛡{c['armor']} · ❤{c['hp']}/{c['hp_max']} · "
+            f"{sub_e}{c['sub']} · ⚡{c['end_max']}{mana}")
 
 
 def unit_line(u: dict) -> str:
@@ -602,17 +614,28 @@ async def db_set_rarity(card_id: int, rarity: str, user_id: int):
 
 
 async def db_admin_set_stats(card_id: int, d: dict):
+    # hp ОБЯЗАТЕЛЕН и передаётся как есть: прокачка больше НИЧЕГО не лечит
+    # и не восстанавливает (по заказу убраны все восстановления).
     await _rest("PATCH", "cards", params={"id": f"eq.{card_id}"}, json_body={
         "level": d["level"], "attack": d["attack"], "armor": d["armor"],
-        "hp": d["hp_max"], "hp_max": d["hp_max"], "sub": d["sub"],
-        "mana_max": d["mana_max"]})
+        "hp": d["hp"], "hp_max": d["hp_max"], "sub": d["sub"],
+        "mana_max": d["mana_max"], "end_max": d["end_max"]})
+
+
+async def db_apply_growth(card_id: int, d: dict):
+    # Запись одного распределённого очка роста (после матча):
+    # статы + остаток pending_levels. Ничего не лечит/восстанавливает.
+    await _rest("PATCH", "cards", params={"id": f"eq.{card_id}"}, json_body=d)
 
 
 async def db_sync_card_after_battle(u: dict, hp: int):
+    # pending_levels — отложенные очки роста: прокачка теперь ТОЛЬКО после
+    # матча, они уезжают в карту и ждут в коллекции («🌟 Ожидают повышения»).
     await _rest("PATCH", "cards", params={"id": f"eq.{u['card_id']}"}, json_body={
         "level": u["level"], "exp": u["xp"], "attack": u["attack"], "armor": u["armor_base"],
         "hp": hp, "hp_max": u["hp_max"], "sub": u["sub"],
-        "mana_max": u["mana_max"], "end_max": u["end_max"]})
+        "mana_max": u["mana_max"], "end_max": u["end_max"],
+        "pending_levels": u.get("pending_levels", 0)})
 
 
 # ---------- бои ----------
@@ -818,8 +841,11 @@ def make_unit(d: dict, side: str, uid: int, card_id=None, hp=None) -> dict:
         "mana": d["mana_max"], "mana_max": d["mana_max"],
         "zone": "deck", "line": None, "pos": None,
         "defending": False,
-        # Очки роста, которые игрок распределяет САМ при повышении уровня:
-        "pending_levels": 0, "bonus_xp": 0,
+        # Очки роста, которые игрок распределяет САМ — но только ПОСЛЕ
+        # матча (в коллекции, раздел «🌟 Ожидают повышения»). Очки,
+        # заработанные в прошлых боях и не распределённые, переносятся
+        # сюда из строки карты и после боя возвращаются в БД.
+        "pending_levels": d.get("pending_levels", 0) or 0, "bonus_xp": 0,
         # Действовала ли карта в ТЕКУЩИЙ ход своей стороны. Сбрасывается в
         # begin_turn; выставляется при любом ДП и при высадке. Нужно для
         # правила «атака при появлении работает только между раундами»:
@@ -863,6 +889,7 @@ def create_battle(cards, layout_key: str, enemy_rarity: str = None) -> dict:
             "rarity": c["rarity"] if "rarity" in c.keys() else "common",
             "level": c["level"], "exp": c["exp"], "attack": c["attack"], "armor": c["armor"],
             "hp_max": c["hp_max"], "sub": c["sub"], "mana_max": c["mana_max"], "end_max": c["end_max"],
+            "pending_levels": c.get("pending_levels", 0) or 0,
         }
         u = make_unit(d, "player", state["next_uid"], card_id=c["id"], hp=c["hp"])
         state["next_uid"] += 1
@@ -1069,11 +1096,14 @@ def wall_aura(state: dict, u: dict) -> bool:
 def eff_armor(u: dict, state: dict = None) -> int:
     # Эффективный КЗ защищающегося:
     #  - выносливость 0 или ❄️ заморозка → КЗ равен нулю;
+    #  - ОТХОД «в пути» (до начала следующего хода хозяина) → КЗ вдвое
+    #    ниже обычного — если за это время карту атакуют, ей тяжело;
     #  - баффы/дебаффы КЗ от заклинаний, болото (−2), аура стены (+3);
     #  - действие «Защита» → КЗ +50% (округление вниз, план п.3.1).
     if u["end"] <= 0 or has_fx(u, "frozen"):
         return 0
-    a = u["armor"] + fx_sum(u, "buff_armor") - fx_sum(u, "debuff_armor")
+    base = u["armor"] // 2 if u.get("retreating") else u["armor"]
+    a = base + fx_sum(u, "buff_armor") - fx_sum(u, "debuff_armor")
     if state is not None and u.get("line"):
         cfx = cell_fx_at(state, u["line"], u["pos"])
         if cfx and cfx["kind"] == "swamp":
@@ -1125,21 +1155,23 @@ def gain_xp(state: dict, u: dict, amount: int):
         u["xp"] -= xp_to_next(u["level"])
         # По желанию заказчика рост с уровнем выбирает ИГРОК: уровень и
         # его вклад в попадание (ПА = d20+3+2×уровень) растут сразу,
-        # а очко статы ждёт распределения через кнопку «🌟 Уровень!».
+        # а очко статы ждёт распределения ПОСЛЕ матча — в коллекции,
+        # раздел «🌟 Ожидают повышения» (прокачка только после боя).
         u["level"] += 1
         u["pending_levels"] = u.get("pending_levels", 0) + 1
         log_add(state, f"🌟 {u['name']} {u['surname']} получает уровень {u['level']}! "
-                       f"Распределите очки роста (кнопка 🌟).")
+                       f"Очки роста — после матча: коллекция → «🌟 Ожидают повышения».")
 
 
 # Возможные варианты роста на выбор игрока (по одному очку за уровень):
 # общие для всех + классовая стата (скрытность/точность; у мага ещё манна).
+# Прокачка НИЧЕГО не лечит и не восстанавливает — только максимумы статов.
 STAT_CHOICE_LABEL = {
     "attack": "⚔️ Атака (АА) +1",
     "armor": "🛡 Защита (КЗ) +1",
-    "hp": "❤️ Макс. здоровье +2 (и вылечить 2)",
-    "end": "⚡ Макс. выносливость +1 (и восстановить 1)",
-    "mana": "🔮 Макс. манна +1 (и восстановить 1)",
+    "hp": "❤️ Макс. здоровье +2",
+    "end": "⚡ Макс. выносливость +1",
+    "mana": "🔮 Макс. манна +1",
 }
 
 
@@ -1154,7 +1186,8 @@ def sub_choice_label(u: dict) -> str:
 
 
 def apply_stat_choice(u: dict, stat: str):
-    # Применение одного очка роста, выбранного игроком
+    # Применение одного очка роста, выбранного игроком.
+    # БЕЗ восстановлений: прокачка поднимает только максимумы (по заказу).
     u["pending_levels"] = max(0, u.get("pending_levels", 1) - 1)
     if stat == "attack":
         u["attack"] += 1
@@ -1163,15 +1196,12 @@ def apply_stat_choice(u: dict, stat: str):
         u["armor_base"] += 1
     elif stat == "hp":
         u["hp_max"] += 2
-        u["hp"] = min(u["hp_max"], u["hp"] + 2)
     elif stat == "end":
         u["end_max"] += 1
-        u["end"] = min(u["end_max"], u["end"] + 1)
     elif stat == "sub":
         u["sub"] += 1
     elif stat == "mana":
         u["mana_max"] += 1
-        u["mana"] = min(u["mana_max"], u["mana"] + 1)
 
 
 def pending_levels_total(state: dict) -> int:
@@ -1183,12 +1213,70 @@ def pending_levels_total(state: dict) -> int:
                if u.get("card_id") is not None)
 
 
+# Подписи кнопок для АДМИНСКОГО распределения очков (вне боя текущих
+# выносливости/манны нет — карта всегда «полная»). Прокачка НИЧЕГО не
+# лечит и не восстанавливает — только максимумы статов (по заказу).
+ADMIN_STAT_LABEL = {
+    "attack": "⚔️ Атака (АА) +1",
+    "armor": "🛡 Защита (КЗ) +1",
+    "hp": "❤️ Макс. здоровье +2",
+    "end": "⚡ Макс. выносливость +1",
+    "mana": "🔮 Макс. манна +1",
+}
+
+
+def apply_card_stat_choice(row, stat: str) -> dict:
+    # Админ-прокачка с распределением: ОДНО очко = +1 уровень и +1 к
+    # выбранной стате. БЕЗ восстановлений: текущее hp не меняется.
+    # Возвращает словарь полей для db_admin_set_stats.
+    d = {"level": row["level"] + 1, "attack": row["attack"], "armor": row["armor"],
+         "hp": row["hp"], "hp_max": row["hp_max"], "sub": row["sub"],
+         "mana_max": row["mana_max"], "end_max": row["end_max"]}
+    if stat == "attack":
+        d["attack"] += 1
+    elif stat == "armor":
+        d["armor"] += 1
+    elif stat == "hp":
+        d["hp_max"] += 2
+    elif stat == "end":
+        d["end_max"] += 1
+    elif stat == "sub":
+        d["sub"] += 1
+    elif stat == "mana":
+        d["mana_max"] += 1
+    return d
+
+
+def apply_pending_point(row, stat: str) -> dict:
+    # Распределение ОДНОГО отложенного очка роста (после матча, из
+    # коллекции — раздел «🌟 Ожидают повышения»). Уровень уже поднят в
+    # бою — здесь повышается ТОЛЬКО стата. Никаких лечений/восстановлений.
+    # Возвращает словарь полей для db_apply_growth.
+    d = {"attack": row["attack"], "armor": row["armor"], "hp_max": row["hp_max"],
+         "sub": row["sub"], "mana_max": row["mana_max"], "end_max": row["end_max"],
+         "pending_levels": max(0, (row.get("pending_levels") or 0) - 1)}
+    if stat == "attack":
+        d["attack"] += 1
+    elif stat == "armor":
+        d["armor"] += 1
+    elif stat == "hp":
+        d["hp_max"] += 2
+    elif stat == "end":
+        d["end_max"] += 1
+    elif stat == "sub":
+        d["sub"] += 1
+    elif stat == "mana":
+        d["mana_max"] += 1
+    return d
+
+
 def kill_unit(state: dict, u: dict):
     line, pos = u["line"], u["pos"]
     del state["board"][line][str(pos)]
     u["zone"] = "graveyard"
     u["line"] = None
     u["pos"] = None
+    u["retreating"] = False   # погибший «в пути» уже никуда не отходит
     state[u["side"]]["graveyard"].append(u)
 
 
@@ -1331,21 +1419,19 @@ def perform_defend(state: dict, side: str, u: dict):
 
 
 def perform_retreat(state: dict, side: str, u: dict):
-    # Действие «Отход»: карта возвращается в колоду, её защита падает
-    # на 50% (план п.3.1). Штраф действует до конца боя (после боя КЗ
-    # восстанавливается из armor_base).
-    line, pos = u["line"], u["pos"]
-    del state["board"][line][str(pos)]
+    # Действие «Отход» (уточнение заказчика): карта НАЧИНАЕТ уходить в
+    # колоду, но физически покидает клетку только в начале СЛЕДУЮЩЕГО хода
+    # хозяина (см. begin_turn — «добрались до колоды»). Всё это время она
+    # считается «в пути»: противник может её атаковать, а её КЗ вдвое
+    # ниже обычного (учитывается в eff_armor). Как только начался следующий
+    # ход хозяина — карта в колоде, КЗ снова полное.
     u["end"] -= 1
-    u["armor"] = u["armor"] // 2
-    u["zone"] = "deck"
-    u["line"] = None
-    u["pos"] = None
+    u["retreating"] = True
     u["defending"] = False
     u["acted_this_turn"] = True
-    state[side]["deck"].append(u)
-    log_add(state, f"↩️ {side_name(side)}: {u['name']} отошёл в колоду "
-                   f"(КЗ до конца боя снижен до {u['armor']}).")
+    log_add(state, f"↩️ {side_name(side)}: {u['name']} отходит в колоду — "
+                   f"в пути КЗ вдвое ниже обычного, пока не начнётся "
+                   f"следующий ход хозяина.")
 
 
 def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
@@ -1396,6 +1482,8 @@ def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
 
 def begin_turn(state: dict, side: str):
     # Начало хода стороны:
+    #  - карты, начавшие ОТХОД в прошлый ход, добираются до колоды
+    #    (штраф КЗ «в пути» больше не действует — уточнение заказчика);
     #  - карты в колоде восстанавливают +1 выносливости и +1 манны (план п.3.6/3.7);
     #  - незадействованные защиты истекают (план п.4.2);
     #  - сбрасывается флаг «действовал в этот ход» у всех юнитов стороны —
@@ -1404,6 +1492,15 @@ def begin_turn(state: dict, side: str):
     #  - УСТАЛОСТЬ (анти-столл, как в Hearthstone): начиная с FATIGUE_ROUND
     #    юниты на поле теряют HP, урон растёт каждые 10 раундов — бой
     #    гарантированно завершается и не может длиться вечно «хилами».
+    arrived = [t for t in board_units(state, side) if t[2].get("retreating")]
+    for line, pos, u in arrived:
+        del state["board"][line][str(pos)]
+        u["retreating"] = False
+        u["zone"] = "deck"
+        u["line"] = None
+        u["pos"] = None
+        state[side]["deck"].append(u)
+        log_add(state, f"🃏 {u['name']} дошёл до колоды — КЗ снова полное ({u['armor']}).")
     for u in state[side]["deck"]:
         if u["end"] < u["end_max"]:
             u["end"] += 1
@@ -1439,9 +1536,17 @@ def begin_turn(state: dict, side: str):
 def can_act(state: dict, side: str) -> bool:
     # Может ли сторона вообще что-то сделать в свой ход:
     # высадить карту из колоды ИЛИ совершить ДП любым юнитом с end>0.
+    # Юнит «в пути» (отход) действовать не может, НО к началу хода
+    # хозяина он доберётся до колоды, а его клетка освободится — значит
+    # высадка снова станет возможной. Для проверки ничьей это считается
+    # «может действовать» — иначе отход последней карты объявлял бы
+    # преждевременную ничью.
+    if any(u.get("retreating") for _, _, u in board_units(state, side)):
+        return True
     if state[side]["deck"] and own_empty_cells(state, side):
         return True
-    return any(u["end"] > 0 for _, _, u in board_units(state, side))
+    return any(u["end"] > 0 and not u.get("retreating")
+               for _, _, u in board_units(state, side))
 
 
 def check_over(state: dict) -> bool:
@@ -2034,6 +2139,7 @@ def apply_spell(state: dict, side: str, caster: dict, sp: dict, spec):
             u["zone"] = "deck"
             u["fx"] = []
             u["defending"] = False
+            u["retreating"] = False
             state[side]["deck"].append(u)
             log_add(state, f"{'🐦 Феникс' if kind == 'phoenix' else '🕯 Возрождение'}: "
                            f"{u['name']} {u['surname']} возвращается в колоду (HP {u['hp']})!")
@@ -2284,6 +2390,7 @@ def ai_act(state: dict, side: str):
         return
 
     attackers = [(line, pos, u) for line, pos, u in board_units(state, side) if u["end"] > 0
+                 and not u.get("retreating")
                  and not has_fx(u, "frozen") and not has_fx(u, "time_lock")]
 
     # --- 2) Единый конкурс «атака против заклинания» ---
@@ -2372,7 +2479,7 @@ def ai_act(state: dict, side: str):
 #     Каждая клетка — инлайн-кнопка:
 #       ▫️ — клетки нет в раскладке, ⬜ — пустая клетка,
 #       иначе юнит (👹 — вражеский, в т.ч. прорвавшийся на ваши линии).
-#   • ниже — вкладка «🃏 Колода» (и «🌟 Уровень!» при наличии очков роста);
+#   • ниже — вкладка «🃏 Колода» и «✨ Магия» (книга заклинаний с поля);
 #   • в самом низу — «Пропустить ход» / «Покинуть бой» и «✖ Отменить»
 #     (кнопка отмены показывается, пока длится выбор цели/клетки).
 #
@@ -2403,6 +2510,8 @@ def unit_flags(u: dict) -> str:
     fl = ""
     if u["defending"]:
         fl += "🔰"
+    if u.get("retreating"):
+        fl += "↩️"
     if u["end"] <= 0:
         fl += "💤"
     if has_fx(u, "frozen"):
@@ -2463,9 +2572,8 @@ def kb_battle(state: dict) -> InlineKeyboardMarkup:
     if not state["over"]:
         # Книга заклинаний теперь прямо на карте боя: кастер → заклинание → цель
         bottom.append(ib("✨ Магия", "SB"))
-    pl = pending_levels_total(state)
-    if pl > 0:
-        bottom.append(ib(f"🌟 Уровень! ({pl})", "LU"))
+    # Прокачка — только после матча: очки роста распределяются в коллекции
+    # (раздел «🌟 Ожидают повышения»), кнопки «🌟 Уровень!» на поле больше нет.
     rows.append(bottom)
     if state["over"]:
         rows.append([ib("⚔️ Ещё раз", "bt:again"), ib("🏠 Меню", "mn:home")])
@@ -2516,9 +2624,8 @@ def battle_text(state: dict) -> str:
     if state["over"]:
         head = (f"🏁 <b>Бой завершён</b> · раундов: {state['round']}\n"
                 f"{RESULT_TEXT.get(state['result'], '')}")
-        if not state.get("rewards_text") and pending_levels_total(state) > 0:
-            head += ("\n\n🌟 Сначала распределите очки роста "
-                     "(кнопка «🌟 Уровень!») — потом итоги запишутся в карты.")
+        # Прокачка — только после матча: итоги сразу пишутся в карты,
+        # а очки роста ждут в коллекции («🌟 Ожидают повышения»).
     else:
         head = (f"⚔️ <b>Раунд {state['round']}</b> · Ваш ход — одно действие\n"
                 f"👹 противник сверху · 🧑 вы снизу")
@@ -2669,7 +2776,7 @@ def spell_target_error(state: dict, side: str, sp: dict, line: str, pos: int,
 # =====================================================================
 
 MENU_TEXT = ("🏠 <b>Главное меню</b>\n\n"
-             "📚 Коллекция — все ваши карты (фильтры, сортировка, просмотр)\n"
+             "📚 Коллекция — все ваши карты (фильтры, сортировка, 🌟 распределение очков роста)\n"
              "🃏 Колода — до 3 боевых колод; ⭐приоритетная идёт в бой без вопроса\n"
              "🎲 Получить карту — новая случайная карта\n"
              "⚔️ Бой — сражение с ботом-противником\n"
@@ -2700,7 +2807,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • Скрытая атака всегда спрашивает подтверждение.
 • Клик по пустой клетке → 🚶 переместиться (захват) или 📥 высадить карту из колоды (на своих линиях). Вкладка «🃏 Колода» — внизу.
 • «✨ Магия» внизу карты боя — книга заклинаний прямо с поля: сначала кастер (видно манну 🔮, выносливость ⚡ и известные заклинания), затем заклинание, затем цель.
-• 🌟 При повышении уровня вы САМИ выбираете, какую стату поднять (очки погибших карт тоже можно распределить).
+• 🌟 Прокачка — ТОЛЬКО после сыгранного матча: в бою зарабатываются уровни и очки роста, а распределяются они потом в «📚 Коллекция» → раздел «🌟 Ожидают повышения» (очки погибших карт не теряются). Прокачка поднимает только МАКСИМУМЫ статов — ничего не лечит и не восстанавливает.
 
 ✨ <b>МАГИЯ (40 заклинаний)</b>
 • Кастуют только ЗАКЛИНАТЕЛИ с поля; заклинания открываются по УРОВНЮ и РЕДКОСТИ карты.
@@ -2718,7 +2825,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • Обычная атака достаёт фронт врага (В1) всегда, а также любую линию, соседнюю с позицией атакующего (чтобы прорвавшихся врагов можно было бить).
 • Скрытая атака (по тылу В2 через заслон фронта): ПСА = d20 − 3 + уровень + 2×(скрытность|точность); Урон = АА × (10 + (ПСА − КЗзаслона//2 − КЗцели)) // 10.
 • Защита: КЗ +50% до первого удара по юниту или до начала вашего следующего хода.
-• Отход: карта уходит в колоду, КЗ падает на 50% до конца боя.
+• Отход: карта НАПРАВЛЯЕТСЯ в колоду и добирается туда к началу вашего следующего хода. «В пути» её КЗ вдвое ниже обычного — если противник атакует её в этот промежуток, защищаться ей тяжело. С началом вашего хода карта уже в колоде, а КЗ снова полное (штраф действует только во время отхода).
 
 ✨ <b>Атака при появлении — только между раундами!</b>
 • Воин, выходя из колоды, автоматически бьёт с преимуществом (+2 к ПА) врага на передней линии — НО только если этот враг НЕ совершал действий в свой прошлый ход («застал врасплох»).
@@ -2965,9 +3072,11 @@ CARDS_PER_PAGE = 5
 
 # Коды фильтров коллекции (участвуют в callback'ах, поэтому короткие):
 #   all — все, w — воины, m — заклинатели, in — в колоде, out — вне колоды,
-#   r0..r9 — по расе (индекс в порядке RACES).
+#   pend — 🌟 ожидают повышения (отложенные очки роста после матча),
+#   q0..q4 — по редкости, r0..r9 — по расе (индекс в порядке RACES).
 COL_FILTERS = [("all", "🧾 Все"), ("w", "⚔️ Воины"), ("m", "🔮 Заклинатели"),
-               ("in", "✅ В колоде"), ("out", "➖ Вне колоды")]
+               ("in", "✅ В колоде"), ("out", "➖ Вне колоды"),
+               ("pend", "🌟 Ожидают повышения")]
 RACE_KEYS = list(RACES.keys())
 
 
@@ -2980,6 +3089,10 @@ def col_filter_cards(cards, f: str):
         return [c for c in cards if c["in_deck"]]
     if f == "out":
         return [c for c in cards if not c["in_deck"]]
+    if f == "pend":
+        # 🌟 Ожидают повышения: карты с отложенными очками роста
+        # (заработаны в матче, распределяются только ПОСЛЕ него).
+        return [c for c in cards if (c.get("pending_levels") or 0) > 0]
     if f.startswith("q") and f[1:].isdigit() and int(f[1:]) < len(RARITY_KEYS):
         rk = RARITY_KEYS[int(f[1:])]
         return [c for c in cards if (c["rarity"] if "rarity" in c.keys() else "common") == rk]
@@ -3013,10 +3126,13 @@ def card_text(row) -> str:
         title_line = (f"\n📜 Титул: «{ttl}»" +
                       (" — используется как имя 🎭" if row.get("use_title") else
                        " (не используется как имя)"))
+    pend = (row.get("pending_levels") or 0) if hasattr(row, "get") else 0
+    pend_line = (f"\n🌟 Очков роста: {pend} — распределите кнопкой ниже "
+                 "(прокачка только после матча)" if pend > 0 else "")
     return "\n".join([
         f"🃏 <b>{disp_name(row)}</b> · #{row['id']}",
         f"{rarity_label(rarity)} · {RACES[row['race']]['emoji']} {row['race']} · {CLS_NAME[row['cls']]}",
-        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}{title_line}",
+        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}{title_line}{pend_line}",
         "",
         f"⚔️ Атака (АА): {row['attack']}",
         f"❤️ Здоровье: {row['hp']}/{row['hp_max']}",
@@ -3035,6 +3151,10 @@ def card_kb(row, ctx: str, page: str) -> InlineKeyboardMarkup:
     cur = f" (сейчас №{row['in_deck']})" if row["in_deck"] else ""
     rows = [[ib(f"📥 В колоду…{cur}"[:64], f"dks:{cid}:{ctx}:{page}")],
             [ib("🗑 Сбросить карту", f"dkd:{cid}:{ctx}:{page}")]]
+    pend = (row.get("pending_levels") or 0) if hasattr(row, "get") else 0
+    if pend > 0:
+        # Прокачка только после матча: отложенные очки распределяются здесь
+        rows.insert(0, [ib(f"🌟 Распределить очки роста ({pend})", f"pls:{cid}:{ctx}:{page}")])
     ttl = (row.get("title") or "").strip() if hasattr(row, "get") else ""
     if row["level"] >= TITLE_MIN_LEVEL:
         if ttl:
@@ -3073,6 +3193,7 @@ async def collection_screen(user_id: int, f: str, page: int):
                    for n in range(1, DECK_COUNT + 1)]
     in_deck_n = sum(deck_counts)
     decks_line = " ".join(f"{n}️⃣{deck_counts[n - 1]}" for n in range(1, DECK_COUNT + 1))
+    pend_n = sum(1 for c in cards if (c.get("pending_levels") or 0) > 0)
     filt = sort_cards(col_filter_cards(cards, flt), srt)
     if not filt:
         return (f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колодах: {in_deck_n} ({decks_line})\n\n"
@@ -3081,15 +3202,18 @@ async def collection_screen(user_id: int, f: str, page: int):
     n_pages = (len(filt) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
     page = max(0, min(page, n_pages - 1))
     chunk = filt[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]
-    lines = [f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колодах: {in_deck_n} ({decks_line})",
+    lines = [f"📚 <b>Коллекция</b>: всего {len(cards)} карт · в колодах: {in_deck_n} ({decks_line})"
+             + (f" · 🌟 ждут повышения: {pend_n}" if pend_n else ""),
              f"Фильтр: {col_filter_label(flt)} · Сортировка: {sort_label(srt)} · показано {len(filt)}",
              f"В бой идут первые {MAX_DECK} карт каждой колоды.", ""]
     rows = []
     for c in chunk:
         mark = f"✅{c['in_deck']}" if c["in_deck"] else "➖"
-        line = card_line(c)
-        lines.append(f"{mark} {line}")
-        rows.append([ib(f"{mark} {line}"[:64], f"card:{c['id']}:{f}:{page}")])
+        if (c.get("pending_levels") or 0) > 0:
+            mark = "🌟" + mark      # карта ждёт распределения очков роста
+        # В тексте сообщения — ВСЕ статы карты; на кнопке — компактно.
+        lines.append(f"{mark} {card_full_line(c)}")
+        rows.append([ib(f"{mark} {card_line(c)}"[:64], f"card:{c['id']}:{f}:{page}")])
     nav = []
     if page > 0:
         nav.append(ib("◀️", f"col:{f}:{page - 1}"))
@@ -3098,10 +3222,10 @@ async def collection_screen(user_id: int, f: str, page: int):
         nav.append(ib("▶️", f"col:{f}:{page + 1}"))
     rows.append(nav)
     rows.append([ib(label, f"col:{code}~{srt}:{page}") for code, label in COL_FILTERS[:3]])
-    rows.append([ib(label, f"col:{code}~{srt}:{page}") for code, label in COL_FILTERS[3:]] +
-                [ib("🎭 Раса", f"colr:{f}"), ib("✨ Редк.", f"colq:{f}")])
-    rows.append([ib("🔃 Сортировка", f"srt:{f}:{page}"),
-                 ib("🃏 Колоды", "dk:1:0"), ib("🏠 Меню", "mn:home")])
+    rows.append([ib(label, f"col:{code}~{srt}:{page}") for code, label in COL_FILTERS[3:]])
+    rows.append([ib("🎭 Раса", f"colr:{f}"), ib("✨ Редк.", f"colq:{f}"),
+                 ib("🔃 Сортировка", f"srt:{f}:{page}")])
+    rows.append([ib("🃏 Колоды", "dk:1:0"), ib("🏠 Меню", "mn:home")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3126,7 +3250,7 @@ async def deck_screen(user_id: int, deck: int = 1, page: int = 0):
             lines.append(f"⚠️ Карт больше {MAX_DECK} — в бой пойдут только первые {MAX_DECK} (⚔️).")
         for i, c in enumerate(in_deck):
             mark = "⚔️" if i < MAX_DECK else "▪️"
-            lines.append(f"{mark} {card_line(c)}")
+            lines.append(f"{mark} {card_full_line(c)}")
     else:
         lines.append("Колода пуста — нажмите на карты в списке ниже, чтобы добавить их.")
     lines += ["", f"<b>Все карты</b> (нажатие = в колоду №{deck} / из колоды):"]
@@ -3394,6 +3518,76 @@ async def cb_title_use(call: CallbackQuery):
     await safe_edit(call, card_text(row), card_kb(row, ctx, page))
 
 
+# ---------- 🌟 Ожидают повышения: распределение отложенных очков роста ----------
+
+def pending_screen(row, ctx: str, page: str):
+    # Экран выбора статы за одно отложенное очко роста (после матча).
+    # Уровень уже поднят в бою — здесь выбирается только стата.
+    # Прокачка ничего не лечит и не восстанавливает.
+    cid = row["id"]
+    pend = row.get("pending_levels") or 0
+    text = (f"🌟 <b>Ожидают повышения</b> — {disp_name(row)}\n\n"
+            f"Свободных очков роста: <b>{pend}</b>. Выберите, какую стату "
+            "повысить (уровень уже получен в бою; прокачка ничего не лечит "
+            "и не восстанавливает):")
+    rows = []
+    for st in stat_choices_for(row):
+        lbl = sub_choice_label(row) if st == "sub" else STAT_CHOICE_LABEL[st]
+        rows.append([ib(lbl, f"plp:{cid}:{st}:{ctx}:{page}")])
+    rows.append([ib("⬅️ К карточке", f"card:{cid}:{ctx}:{page}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("pls:"))
+async def cb_pending_start(call: CallbackQuery):
+    # «🌟 Распределить очки роста» из карточки — только когда нет активного боя
+    _, cid, ctx, page = call.data.split(":")
+    uid = call.from_user.id
+    if await db_load_battle(uid):
+        await safe_answer(call, "Прокачка доступна только ПОСЛЕ матча — "
+                                "сначала завершите бой.", show_alert=True)
+        return
+    row = await db_get_card(int(cid), uid)
+    await safe_answer(call)
+    if not row:
+        await safe_edit(call, "Карта не найдена.", kb([ib("⬅️ Назад", back_cb(ctx, page))]))
+        return
+    if (row.get("pending_levels") or 0) <= 0:
+        await safe_edit(call, card_text(row), card_kb(row, ctx, page))
+        return
+    text, markup = pending_screen(row, ctx, page)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("plp:"))
+async def cb_pending_apply(call: CallbackQuery):
+    # Применение одного очка: стата +1, pending_levels −1
+    # (уровень НЕ меняется — он уже поднят в бою).
+    _, cid, stat, ctx, page = call.data.split(":")
+    uid = call.from_user.id
+    if await db_load_battle(uid):
+        await safe_answer(call, "Прокачка доступна только ПОСЛЕ матча.", show_alert=True)
+        return
+    row = await db_get_card(int(cid), uid)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if stat not in stat_choices_for(row):
+        await safe_answer(call, "Эта стата недоступна для класса карты.", show_alert=True)
+        return
+    if (row.get("pending_levels") or 0) <= 0:
+        await safe_answer(call, "Свободных очков роста нет.", show_alert=True)
+        return
+    await db_apply_growth(int(cid), apply_pending_point(row, stat))
+    row = await db_get_card(int(cid), uid)
+    await safe_answer(call, "🌟 Очко вложено")
+    if (row.get("pending_levels") or 0) > 0:
+        text, markup = pending_screen(row, ctx, page)
+    else:
+        text, markup = card_text(row), card_kb(row, ctx, page)
+    await safe_edit(call, text, markup)
+
+
 @router.callback_query(F.data.startswith("dkt:"))
 async def cb_toggle_deck(call: CallbackQuery):
     # Устаревший колбэк старых сообщений: быстрый тумблер колоды №1.
@@ -3603,7 +3797,7 @@ async def load_active_battle(call: CallbackQuery):
 async def finish_player_action(call: CallbackQuery, state: dict):
     # Единый финал любого действия игрока:
     # ход противника (ИИ сразу) → если бой завершён, подводим итоги
-    # (возможно, отложенно — пока не распределены очки роста) → рендер.
+    # (сразу пишутся в карты; очки роста ждут распределения в коллекции) → рендер.
     advance_turn(state)
     if state["over"]:
         await end_battle(call.from_user.id, state)
@@ -3614,9 +3808,10 @@ async def finish_player_action(call: CallbackQuery, state: dict):
 
 
 async def end_battle(user_id: int, state: dict) -> bool:
-    # Завершение боя в три этапа. Возвращает True, если бой окончательно
-    # закрыт (карты синхронизированы с БД), False — если ждём, пока игрок
-    # распределит очки роста через кнопку «🌟 Уровень!».
+    # Завершение боя. Результаты СРАЗУ записываются в карты — включая
+    # отложенные очки роста (pending_levels): прокачка теперь доступна
+    # ТОЛЬКО после сыгранного матча, в коллекции («🌟 Ожидают повышения»).
+    # Возвращает True — бой окончательно закрыт.
     #
     # Этап 1: бонусный опыт за исход боя (начисляется один раз).
     if not state.get("bonus_applied"):
@@ -3630,19 +3825,15 @@ async def end_battle(user_id: int, state: dict) -> bool:
                 u["pending_levels"] = u.get("pending_levels", 0) + 1
         state["bonus_applied"] = True
 
-    # Этап 2: есть нераспределённые очки роста — бой остаётся в БД,
-    # игрок распределяет их (рост выбирает сам), затем финал повторится.
-    if pending_levels_total(state) > 0:
-        await db_save_battle(user_id, state)
-        return False
-
-    # Этап 3: переносим результаты в БД карт:
+    # Этап 2: переносим результаты в БД карт:
     #  - погибшие карты НЕ исчезают навсегда (правка заказчика): они лишь
     #    выбывают до конца текущего боя, а после боя возвращаются в
     #    коллекцию восстановленными (hp = hp_max; при HEAL_AFTER_BATTLE=
     #    False — «выживают на 1 hp»);
     #  - выжившие лечатся, если HEAL_AFTER_BATTLE=True;
-    #  - КЗ восстанавливается к базовому (штраф отхода — только на бой).
+    #  - КЗ восстанавливается к базовому (штраф отхода — только на бой);
+    #  - отложенные очки роста (pending_levels) уезжают в карту — игрок
+    #    распределит их ПОСЛЕ матча в коллекции.
     units = [u for u in all_units(state, "player") if u.get("card_id") is not None]
     # (призванные големы card_id не имеют — после боя они просто исчезают)
     lines = ["🎖 <b>Итоги боя</b>"]
@@ -3666,6 +3857,10 @@ async def end_battle(user_id: int, state: dict) -> bool:
     await db_delete_battle(user_id)
     if HEAL_AFTER_BATTLE and lost < len(units):
         lines.append("❤️ Выжившие карты вылечены.")
+    total_pend = pending_levels_total(state)
+    if total_pend > 0:
+        lines.append(f"🌟 <b>Очков роста к распределению: {total_pend}</b> — прокачка "
+                     f"после матча: «📚 Коллекция» → «🌟 Ожидают повышения».")
     state["rewards_text"] = "\n".join(lines)
     return True
 
@@ -3688,9 +3883,9 @@ async def cb_battle_view(call: CallbackQuery):
 async def cb_battle_again(call: CallbackQuery):
     st = await db_load_battle(call.from_user.id)
     if st:
-        # Бой ещё в БД: либо не распределены очки роста, либо финал
-        # прервался перезапуском — показываем экран завершения/очков.
-        if st["over"] and pending_levels_total(st) == 0:
+        # Бой ещё в БД: финал прервался перезапуском — докачиваем итоги
+        # в карты (включая отложенные очки роста) и показываем экран.
+        if st["over"]:
             await end_battle(call.from_user.id, st)
         await safe_answer(call)
         await safe_edit(call, battle_text(st), kb_battle(st))
@@ -3909,6 +4104,16 @@ async def cb_place_pick(call: CallbackQuery):
 
 async def show_unit_menu(call: CallbackQuery, state: dict, u: dict):
     # Клик по своему юниту — выбор одного из ДП
+    if u.get("retreating"):
+        # Карта «в пути» в колоду (отход): действовать не может, КЗ вдвое
+        # ниже до начала следующего хода хозяина.
+        text = (unit_info(u) + "\n\n↩️ <b>Карта отходит в колоду</b> — она «в пути» "
+                "до начала вашего следующего хода: КЗ вдвое ниже обычного, "
+                "действовать не может.")
+        markup = kb([ib("⬅️ Назад", "bt:view")])
+        await safe_answer(call)
+        await safe_edit(call, text, markup)
+        return
     if u["end"] <= 0:
         text = (unit_info(u) + "\n\n💤 <b>Истощение!</b> Выносливость на нуле: КЗ=0 и карта "
                 "не может действовать (даже отступить — отход тоже требует выносливость).")
@@ -3920,7 +4125,7 @@ async def show_unit_menu(call: CallbackQuery, state: dict, u: dict):
         rows = [
             [ib(f"⚔️ Атака{atk_cost}", f"A:{u['uid']}"), ib(f"🗡 Скрытая атака{stl_cost}", f"S:{u['uid']}")],
             [ib("🚶 Переместиться (захват клетки)", f"M:{u['uid']}")],
-            [ib("🛡 Защита (КЗ +50%)", f"D:{u['uid']}"), ib("↩️ Отход (в колоду, КЗ −50%)", f"R:{u['uid']}")],
+            [ib("🛡 Защита (КЗ +50%)", f"D:{u['uid']}"), ib("↩️ Отход (в колоду; КЗ −50% в пути)", f"R:{u['uid']}")],
         ]
         if u["cls"] == CLS_MAGE:
             # Маги дополнительно умеют кастовать заклинания (✨ Магия)
@@ -4498,89 +4703,36 @@ async def cb_deck_place(call: CallbackQuery):
 
 # ---------- распределение очков роста (игрок выбирает сам) ----------
 
-@router.callback_query(F.data == "LU")
-async def cb_levelup_list(call: CallbackQuery):
+async def _levelup_moved(call: CallbackQuery):
+    # Прокачка перенесена из боя: распределение очков роста теперь ТОЛЬКО
+    # после сыгранного матча — в коллекции, раздел «🌟 Ожидают повышения».
+    # Старые кнопки (LU/LUS/lup) могли остаться в прежних сообщениях.
     state = await db_load_battle(call.from_user.id)
     if state is None:
         await safe_answer(call, "У вас нет активного боя.", show_alert=True)
         return
-    cands = [u for u in all_units(state, "player") if u.get("pending_levels", 0) > 0]
-    if not cands:
-        # Очков нет: если бой завершён — это страховка финала после сбоя
-        if state["over"] and state.get("bonus_applied"):
-            await end_battle(call.from_user.id, state)
-        await safe_answer(call)
-        await safe_edit(call, battle_text(state), kb_battle(state))
-        return
-    text = "🌟 <b>Повышение уровня!</b>\nВыберите карту, чтобы распределить очки роста:"
-    rows = [[ib(f"{'💀 ' if u['hp'] <= 0 else '🌟 '}{u['name']} L{u['level']} — очков: {u['pending_levels']}",
-                f"LUS:{u['uid']}")]
-            for u in cands]
-    rows.append([ib("⬅️ Назад", "bt:view")])
-    await safe_answer(call)
-    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    if state["over"]:
+        # Страховка финализации после сбоя: итоги (включая очки) пишутся в карты
+        await end_battle(call.from_user.id, state)
+    await safe_answer(call, "🌟 Прокачка — только после матча: откройте "
+                            "«📚 Коллекция» → раздел «🌟 Ожидают повышения».",
+                      show_alert=True)
+    await safe_edit(call, battle_text(state), kb_battle(state))
+
+
+@router.callback_query(F.data == "LU")
+async def cb_levelup_list(call: CallbackQuery):
+    await _levelup_moved(call)
 
 
 @router.callback_query(F.data.startswith("LUS:"))
 async def cb_levelup_stats(call: CallbackQuery):
-    state = await db_load_battle(call.from_user.id)
-    if state is None:
-        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
-        return
-    uid = int(call.data.split(":")[1])
-    _, u, _, _ = find_unit(state, uid)
-    if u is None or u["side"] != "player" or u.get("pending_levels", 0) <= 0:
-        await safe_answer(call, "Нет доступных очков роста.", show_alert=True)
-        return
-    text = (unit_info(u) + f"\n\n🌟 Свободных очков роста: <b>{u['pending_levels']}</b>\n"
-            f"Выберите, что повысить (одно очко = один выбор):")
-    rows = []
-    for stat in stat_choices_for(u):
-        label = sub_choice_label(u) if stat == "sub" else STAT_CHOICE_LABEL[stat]
-        rows.append([ib(label, f"lup:{uid}:{stat}")])
-    rows.append([ib("⬅️ Назад", "LU")])
-    await safe_answer(call)
-    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await _levelup_moved(call)
 
 
 @router.callback_query(F.data.startswith("lup:"))
 async def cb_levelup_apply(call: CallbackQuery):
-    state = await db_load_battle(call.from_user.id)
-    if state is None:
-        await safe_answer(call, "У вас нет активного боя.", show_alert=True)
-        return
-    _, uid_s, stat = call.data.split(":")
-    uid = int(uid_s)
-    _, u, _, _ = find_unit(state, uid)
-    if u is None or u["side"] != "player" or u.get("pending_levels", 0) <= 0:
-        await safe_answer(call, "Нет доступных очков роста.", show_alert=True)
-        return
-    if stat not in stat_choices_for(u):
-        await safe_answer(call, "Недоступный рост для этого класса.", show_alert=True)
-        return
-    apply_stat_choice(u, stat)
-    label = sub_choice_label(u) if stat == "sub" else STAT_CHOICE_LABEL[stat]
-    log_add(state, f"🌟 {u['name']} {u['surname']}: выбран рост — {label}")
-    await safe_answer(call, "✅ Рост применён")
-    if state["over"]:
-        # Бой уже завершён: применяем очко и пробуем финализировать
-        # (если очков больше нет — итоги запишутся в БД).
-        await end_battle(call.from_user.id, state)
-        await safe_edit(call, battle_text(state), kb_battle(state))
-        return
-    await db_save_battle(call.from_user.id, state)
-    if u.get("pending_levels", 0) > 0:
-        # У карты остались очки — показываем выбор снова
-        text = (unit_info(u) + f"\n\n🌟 Свободных очков роста: <b>{u['pending_levels']}</b>\n"
-                f"Выберите, что повысить (одно очко = один выбор):")
-        rows = []
-        for st2 in stat_choices_for(u):
-            lbl = sub_choice_label(u) if st2 == "sub" else STAT_CHOICE_LABEL[st2]
-            rows.append([ib(lbl, f"lup:{uid}:{st2}")])
-        rows.append([ib("⬅️ Назад", "LU")])
-        await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
-    else:
-        await safe_edit(call, battle_text(state), kb_battle(state))
+    await _levelup_moved(call)
 
 
 # ---------- пропуск хода и бегство ----------
@@ -4636,8 +4788,9 @@ ADMIN_PAGE = 8
 
 def admin_text() -> str:
     return ("🛠 <b>Админ-панель</b>\n\n"
-            "🎲 Выдать карту — любая редкость, сразу в колоду\n"
-            "⬆️ Прокачать — +1/+5/+10 уровней или «до 10»\n"
+            "🎲 Выдать карту — любая редкость, сразу в колоду №1\n"
+            "⬆️ Прокачать — +1/+5/+10 уровней или «до 10»; очки роста можно "
+            "распределить вручную 🎯 (как в бою) или применить автоматически 🎲\n"
             "✨ Редкость — изменить грейд карты\n"
             "🗑 Удалить карту\n"
             "❤️ Вылечить все карты\n"
@@ -4778,10 +4931,11 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             r = None if parts[2] == "rand" else parts[2]
             d = generate_card_data(rarity=r)
             cid = await db_add_card(uid, d)
-            await db_set_in_deck(cid, 1)  # админская карта сразу в колоде
+            await db_set_in_deck(cid, 1)  # админская карта сразу в колоде №1
             row = await db_get_card(cid, uid)
             await safe_answer(call, "Карта выдана ✅")
-            await safe_edit(call, "🎲 <b>Карта выдана</b> (сразу добавлена в колоду):\n\n" + card_text(row),
+            await safe_edit(call, "🎲 <b>Карта выдана</b> (сразу добавлена в колоду №1 "
+                                  "— при желании переложите в «🃏 Колода»):\n\n" + card_text(row),
                             kb([ib("🎲 Выдать ещё", "adm:new")], [ib("🛠 Панель", "adm:root")]))
         return
 
@@ -4824,17 +4978,21 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             if not row:
                 await safe_answer(call, "Карта не найдена.", show_alert=True)
                 return
-            d = {"level": row["level"], "attack": row["attack"], "armor": row["armor"],
-                 "hp_max": row["hp_max"], "sub": row["sub"], "mana_max": row["mana_max"],
-                 "cls": row["cls"]}
-            target = d["level"] + n if parts[2] == "up" else max(d["level"], n)
-            while d["level"] < target:
-                apply_level_growth(d)  # админ-прокачка: рост применяется сразу
-            await db_admin_set_stats(cid, d)
-            row = await db_get_card(cid, uid)
-            await safe_answer(call, "⬆️ Прокачано")
-            await safe_edit(call, card_text(row),
-                            kb([ib("⬆️ Прокачать ещё", f"adm:lvl:pick:{cid}")], [ib("🛠 Панель", "adm:root")]))
+            # Сколько уровней предстоит получить
+            cnt = n if parts[2] == "up" else max(0, n - row["level"])
+            if cnt <= 0:
+                await safe_answer(call, f"Уровень уже {row['level']} — повышать нечего.",
+                                  show_alert=True)
+                return
+            await safe_answer(call)
+            await safe_edit(call, f"⬆️ <b>Прокачка: +{cnt} уровней</b>\n\n" + card_text(row) +
+                            "\n\nКак применить рост?\n"
+                            "🎯 <b>Вручную</b> — каждое очко = +1 уровень и +1 к выбранной "
+                            "стате (как в бою, можно прерваться в любой момент).\n"
+                            "🎲 <b>Авто</b> — стандартный рост за уровень.",
+                            kb([ib("🎯 Распределить очки вручную", f"lvlm:{cid}:{cnt}")],
+                               [ib("🎲 Автоматический рост", f"lvla:{cid}:{cnt}")],
+                               [ib("⬅️ Назад", f"adm:lvl:pick:{cid}")]))
             return
         if op == "rar" and parts[2] == "set":
             cid, key = int(parts[3]), parts[4]
@@ -4890,6 +5048,107 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
 
     await safe_answer(call)
     await safe_edit(call, admin_text(), admin_kb())
+
+
+# =====================================================================
+# АДМИН-ПРОКАЧКА С РАСПРЕДЕЛЕНИЕМ ОЧКОВ (заказ Richard Quant):
+# каждое очко = +1 уровень и +1 к выбранной стате — как в боевом потоке
+# «🌟 Уровень!». Состояние не храним: остаток очков живёт в callback
+# (lvlm:{cid}:{осталось}[:{стата}]) — для serverless это безопасно.
+# =====================================================================
+
+async def _admin_ok(call: CallbackQuery) -> bool:
+    # Страж админ-доступа для отдельных админ-хендлеров
+    if not await user_flag(call.from_user.id, "is_admin"):
+        await safe_answer(call, "Нужен админ-доступ: отправьте /admin.", show_alert=True)
+        return False
+    return True
+
+
+async def _admin_lvl_final(call: CallbackQuery, row, head: str):
+    # Финальный экран прокачки: карточка + «ещё»/«панель»
+    await safe_edit(call, head + card_text(row),
+                    kb([ib("⬆️ Прокачать ещё", f"adm:lvl:pick:{row['id']}")],
+                       [ib("🛠 Панель", "adm:root")]))
+
+
+@router.callback_query(F.data.startswith("lvlm:"))
+async def cb_admin_lvl_manual(call: CallbackQuery):
+    # Ручное распределение: lvlm:{cid}:{осталось очков}[:{стата}]
+    if not await _admin_ok(call):
+        return
+    parts = call.data.split(":")
+    cid, cnt = int(parts[1]), int(parts[2])
+    stat = parts[3] if len(parts) > 3 else None
+    uid = call.from_user.id
+    row = await db_get_card(cid, uid)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if stat:
+        if stat not in stat_choices_for(row):
+            await safe_answer(call, "Эта стата недоступна для класса карты.", show_alert=True)
+            return
+        await db_admin_set_stats(cid, apply_card_stat_choice(row, stat))
+        row = await db_get_card(cid, uid)
+        cnt -= 1
+        await safe_answer(call, f"⬆️ L{row['level']} — очко вложено")
+        if cnt <= 0:
+            await _admin_lvl_final(call, row, "✅ <b>Прокачка завершена</b> — "
+                                              "все очки распределены.\n\n")
+            return
+    else:
+        await safe_answer(call)
+    text = (f"⬆️ <b>Прокачка: распределение очков</b>\n\n"
+            f"Осталось вложить: <b>{cnt}</b> (каждое очко = +1 уровень и +1 стата).\n\n"
+            + card_text(row))
+    rows = []
+    for st in stat_choices_for(row):
+        lbl = sub_choice_label(row) if st == "sub" else ADMIN_STAT_LABEL[st]
+        rows.append([ib(lbl, f"lvlm:{cid}:{cnt}:{st}")])
+    rows.append([ib("⏭ Завершить (остаток не вкладывать)", f"lvlfin:{cid}")])
+    rows.append([ib("🛠 Панель", "adm:root")])
+    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("lvla:"))
+async def cb_admin_lvl_auto(call: CallbackQuery):
+    # Автоматическая прокачка (как раньше): apply_level_growth за уровень.
+    # БЕЗ лечения: текущее hp сохраняется как есть (все восстановления
+    # при прокачке убраны по заказу).
+    if not await _admin_ok(call):
+        return
+    parts = call.data.split(":")
+    cid, cnt = int(parts[1]), int(parts[2])
+    uid = call.from_user.id
+    row = await db_get_card(cid, uid)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    d = {"level": row["level"], "attack": row["attack"], "armor": row["armor"],
+         "hp": row["hp"], "hp_max": row["hp_max"], "sub": row["sub"],
+         "mana_max": row["mana_max"], "end_max": row["end_max"], "cls": row["cls"]}
+    for _ in range(cnt):
+        apply_level_growth(d)
+    await db_admin_set_stats(cid, d)
+    row = await db_get_card(cid, uid)
+    await safe_answer(call, "⬆️ Прокачано (авто)")
+    await _admin_lvl_final(call, row, "")
+
+
+@router.callback_query(F.data.startswith("lvlfin:"))
+async def cb_admin_lvl_finish(call: CallbackQuery):
+    # Досрочное завершение распределения: уже вложенные уровни остаются,
+    # остаток очков просто не применяется.
+    if not await _admin_ok(call):
+        return
+    cid = int(call.data.split(":")[1])
+    row = await db_get_card(cid, call.from_user.id)
+    await safe_answer(call, "Распределение завершено")
+    if not row:
+        await safe_edit(call, "Карта не найдена.", kb([ib("🛠 Панель", "adm:root")]))
+        return
+    await _admin_lvl_final(call, row, "⏹ <b>Распределение завершено досрочно.</b>\n\n")
 
 
 # =====================================================================
