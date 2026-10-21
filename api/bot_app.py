@@ -133,7 +133,15 @@ RARITY_INFO = {
     "legendary": {"label": "🟨 Легендарная", "mult": 120, "weight": 2,  "rank": 4},
 }
 RARITY_KEYS = list(RARITY_INFO.keys())
-PITY_THRESHOLD = 40  # 40 карт подряд без «редкой+» → следующая гарантированно 🟦+
+
+# ГАРАНТ (pity) — по заказу настраивается ПЕРЕМЕННОЙ: для каждой редкости
+# число = сколько карт подряд «ниже этой редкости» гарантируют её выпадение;
+# -1 = гаранта на эту редкость НЕТ. Сейчас гарант ОТКЛЮЧЁН на все редкости.
+PITY_CONFIG = {
+    "rare": -1,        # раньше было 40 — до отключения гаранта
+    "epic": -1,
+    "legendary": -1,
+}
 
 
 def rarity_rank(r: str) -> int:
@@ -168,6 +176,12 @@ def sanitize_title(text: str) -> str:
     # Титул вводится игроком и попадает в HTML-сообщения — вырезаем
     # опасные символы и ограничиваем длину.
     return re.sub(r"[<>&]", "", text or "").strip()[:32]
+
+
+def sanitize_nick(text: str) -> str:
+    # Внутриигровой ник («👤 Профиль») — те же правила, что и для титула:
+    # без HTML-спецсимволов (parse_mode=HTML глобальный), длина до 24.
+    return re.sub(r"[<>&]", "", text or "").strip()[:24]
 
 
 def disp_name(x, surname: bool = True) -> str:
@@ -532,6 +546,37 @@ async def set_user_flag(user_id: int, col: str, val: int):
                 json_body={col: val})
 
 
+async def db_get_profile(user_id: int):
+    # «👤 Профиль»: внутриигровой ник + статистика боёв
+    rows = await _rest("GET", "users", params={
+        "user_id": f"eq.{user_id}",
+        "select": "username,nickname,wins,draws,losses", "limit": "1"})
+    return rows[0] if rows else None
+
+
+async def db_set_nickname(user_id: int, nick: str):
+    await _rest("PATCH", "users", params={"user_id": f"eq.{user_id}"},
+                json_body={"nickname": nick})
+
+
+# Исход боя → счётчик в профиле. Побег с поля считается поражением.
+RESULT_COL = {"victory": "wins", "defeat": "losses", "draw": "draws", "flee": "losses"}
+
+
+async def db_add_result(user_id: int, result: str):
+    # +1 к победам/ничьим/поражениям. Атомарного инкремента в PostgREST без
+    # RPC нет — читаем и перезаписываем (бои одного пользователя идут
+    # последовательно, гонка исключена).
+    col = RESULT_COL.get(result)
+    if not col:
+        return
+    rows = await _rest("GET", "users", params={
+        "user_id": f"eq.{user_id}", "select": col, "limit": "1"})
+    cur = (rows[0].get(col) or 0) if rows else 0
+    await _rest("PATCH", "users", params={"user_id": f"eq.{user_id}"},
+                json_body={col: cur + 1})
+
+
 # ---------- карты ----------
 
 async def db_add_card(user_id: int, d: dict) -> int:
@@ -707,11 +752,23 @@ def apply_level_growth(d: dict):
         d["mana_max"] += 1
 
 
-def roll_rarity(pity: bool = False) -> str:
-    # Розыгрыш редкости по весам; pity=True — только 🟦 редкая и выше
-    keys = RARITY_KEYS[2:] if pity else RARITY_KEYS
+def roll_rarity(min_rank: int = 0) -> str:
+    # Розыгрыш редкости по весам; min_rank — нижняя планка (гарант:
+    # «указанная редкость и выше»)
+    keys = [k for k in RARITY_KEYS if rarity_rank(k) >= min_rank]
     weights = [RARITY_INFO[k]["weight"] for k in keys]
     return random.choices(keys, weights=weights, k=1)[0]
+
+
+def pity_guarantee(counter: int):
+    # Какая редкость гарантирована при таком счётчике (None — никакая).
+    # Счётчик (users.pity) считает карты подряд НИЖЕ «редкой»; если порог
+    # сработал для нескольких редкостей — побеждает старшая.
+    active = {r: n for r, n in PITY_CONFIG.items() if n >= 0}
+    for r in sorted(active, key=rarity_rank, reverse=True):
+        if counter >= active[r]:
+            return r
+    return None
 
 
 def generate_card_data(level: int = 1, rarity: str = None) -> dict:
@@ -977,12 +1034,16 @@ def can_move_to(state: dict, u: dict, line: str, pos: int) -> bool:
 
 
 def can_normal_attack(u: dict, tgt_line: str) -> bool:
-    # Обычная атака (план п.1.1: воин бьёт первую линию врага) достаёт:
-    #  - фронт противника (В1 для игрока / С1 для ИИ) — всегда, по плану;
-    #  - ЛЮБУЮ линию в зоне досягаемости атакующего (своя или соседняя) —
-    #    иначе враги, прорвавшиеся перемещением на ваши линии, были бы неуязвимы.
-    return (tgt_line == row_of(other_side(u["side"]), "front")
-            or abs(ROW_ORDER[u["line"]] - ROW_ORDER[tgt_line]) <= 1)
+    # Дальность обычной атаки (правка заказчика):
+    #  - ВОИН (ближний бой): только линии в пределах ±1 от своей —
+    #    своя линия, соседние фронт/тыл (в т.ч. враги, прорвавшиеся на
+    #    ваши линии). Фронт врага из тыла «через две линии» больше не бьётся;
+    #  - ЗАКЛИНАТЕЛЬ (дальняя атака): дополнительно всегда достаёт
+    #    переднюю линию противника.
+    if abs(ROW_ORDER[u["line"]] - ROW_ORDER[tgt_line]) <= 1:
+        return True
+    return (u["cls"] == CLS_MAGE
+            and tgt_line == row_of(other_side(u["side"]), "front"))
 
 
 def can_stealth_attack(u: dict, tgt_line: str) -> bool:
@@ -1453,9 +1514,10 @@ def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
     # раундами»): воин, появляясь на поле, автоматически бьёт с
     # преимуществом (+2 к ПА) врага на передней линии противника — но
     # ТОЛЬКО если этот враг не совершал действий в свой прошлый ход
-    # (acted_this_turn=False). Цель — клетка прямо напротив (4−pos),
-    # а если она пуста/не существует — ближайшая подходящая.
-    if u["cls"] == CLS_WARRIOR:
+    # (acted_this_turn=False) и фронт в пределах досягаемости воина
+    # (±1 линии — общее правило дальности). Цель — клетка прямо напротив
+    # (4−pos), а если она пуста/не существует — ближайшая подходящая.
+    if u["cls"] == CLS_WARRIOR and can_normal_attack(u, row_of(other_side(side), "front")):
         opp = other_side(side)
         front_line = row_of(opp, "front")
         idle = []
@@ -1602,9 +1664,9 @@ def advance_turn(state: dict):
 #
 # Правила (по заданию заказчика):
 #  • кастуют ТОЛЬКО заклинатели (маги), стоящие на поле;
-#  • каст тратит ВЕСЬ пул манны (drain="all") или почти весь ("all_but_1"
-#    — оставляет 1🔮); после каста маг почти пуст и должен уйти в колоду
-#    восстанавливаться — это естественный кулдаун;
+#  • каст тратит СТОИМОСТЬ заклинания (min_mana) — потребление манны
+#    ограничено одним заклинанием, остаток пула сохраняется (правка
+#    заказчика; поле "drain" в данных оставлено, но больше не используется);
 #  • заклинания ОТКРЫВАЮТСЯ ПО УРОВНЯМ мага (lvl) и его РЕДКОСТИ (rarity);
 #  • каст — это ДП: −1⚡ выносливости и всё действие игрока (ДИ) на ход;
 #  • замороженный/пойманный «временной петлёй» маг кастовать не может.
@@ -1614,9 +1676,8 @@ def advance_turn(state: dict):
 #  • магический урон бьёт по КЗ//2 (пробитие), поэтому коэффициенты скромные;
 #  • весь контроль — через спасбросок d20+уровень цели против DC;
 #  • заморозка не работает по целям с эффективным КЗ ≥ 20;
-#  • стоимость пула = 4–6 обычных атак мага → заклинание должно быть
-#    выгоднее примерно во столько же раз, цифры подобраны аналитикой
-#    (см. docs/zh_legendary_magic.md) и fuzz-тестами (test_spells.py).
+#  • цена заклинания (min_mana) = 2–7🔮, обычная атака мага = 1🔮 — цены
+#    подобраны аналитикой (см. docs/zh_legendary_magic.md) и fuzz-тестами.
 # =====================================================================
 
 # target — что выбирает игрок после каста:
@@ -1801,6 +1862,56 @@ SPELLS = {
 NEGATIVE_FX = {"debuff_armor", "debuff_attack_pct", "debuff_attack_flat",
                "frozen", "time_lock"}
 
+# Человекочитаемые подписи целей заклинаний (для справочника «📖 Книга
+# заклинаний» и боевого меню магии — заказчик просил «чёткие эффекты»).
+SPELL_TARGETS = {
+    "enemy_unit": "вражеский юнит", "ally_unit": "союзный юнит",
+    "enemy_cell": "клетка врага", "own_front_empty": "своя пустая клетка фронта",
+    "own_empty": "своя пустая клетка", "enemy_line": "линия врага (на выбор)",
+    "ally_line": "своя линия (на выбор)", "all_enemies": "все враги на поле",
+    "all_allies": "все союзники на поле", "all_enemy_cells": "все клетки врага",
+    "ally_grave": "погибшая карта (кладбище)",
+}
+
+SPELLS_PER_PAGE = 4
+
+
+def spell_line(sid: str) -> str:
+    # Справочная строка заклинания: БАЗОВЫЕ СТАТЫ (редкость, уровень,
+    # стоимость 🔮, цель) + чёткое описание действия.
+    sp = SPELLS[sid]
+    tgt = SPELL_TARGETS.get(sp["target"], sp["target"])
+    return (f"{sp['emoji']} <b>{sp['name']}</b> · {rarity_label(sp['rarity'])} · "
+            f"⭐L{sp['lvl']} · 🔮{sp['min_mana']} · цель: {tgt}\n"
+            f"    Эффект: {sp['desc']}")
+
+
+def spellbook_screen(rk: str, page: int):
+    # «📖 Книга заклинаний» — раздел главного меню: ВСЕ заклинания с
+    # базовыми статами и описаниями эффектов. Фильтр по редкости + страницы.
+    if rk != "all" and rk not in RARITY_INFO:
+        rk = "all"
+    sids = [sid for sid, sp in SPELLS.items() if rk == "all" or sp["rarity"] == rk]
+    n_pages = max(1, (len(sids) + SPELLS_PER_PAGE - 1) // SPELLS_PER_PAGE)
+    page = max(0, min(int(page), n_pages - 1))
+    chunk = sids[page * SPELLS_PER_PAGE:(page + 1) * SPELLS_PER_PAGE]
+    head = ("📖 <b>Книга заклинаний</b> — справочник магии заклинателей 🔮.\n"
+            "Каст тратит стоимость заклинания (🔮), 1⚡ и всё действие хода; "
+            "манна копится в колоде (+1🔮 за ход).\n")
+    label = "🧾 Все" if rk == "all" else rarity_label(rk)
+    head += f"\n{label}: {len(sids)} заклинаний · стр. {page + 1}/{n_pages}\n\n"
+    text = head + "\n\n".join(spell_line(sid) for sid in chunk)
+    rows = [[ib("🧾", "spb:all:0")] +
+            [ib(rarity_label(k).split(" ")[0], f"spb:{k}:0") for k in RARITY_KEYS]]
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️", f"spb:{rk}:{page - 1}"))
+    nav.append(ib("🏠 Меню", "mn:home"))
+    if page < n_pages - 1:
+        nav.append(ib("▶️", f"spb:{rk}:{page + 1}"))
+    rows.append(nav)
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def spell_available(u: dict, sp: dict) -> bool:
     # Может ли юнит прямо сейчас скастовать заклинание
@@ -1876,16 +1987,18 @@ def summon_golem(state: dict, side: str, caster: dict, line: str, pos: int):
 
 
 def cast_spell(state: dict, side: str, caster: dict, sid: str, spec):
-    # Розыгрыш заклинания: стоимость — всё ДИ, 1⚡ и весь (почти весь) пул манны
+    # Розыгрыш заклинания: стоимость — всё ДИ, 1⚡ и ЦЕНА самого заклинания
+    # (min_mana). По заказу потребление манны ограничено одним заклинанием —
+    # остаток пула сохраняется у мага (поле «drain» в данных больше не используется).
     sp = SPELLS[sid]
     if not spell_available(caster, sp):
         return False
-    pool = caster["mana"]
+    cost = sp["min_mana"]
     caster["end"] -= 1
     caster["acted_this_turn"] = True
-    caster["mana"] = 1 if sp["drain"] == "all_but_1" else 0
+    caster["mana"] = max(0, caster["mana"] - cost)
     log_add(state, f"✨ {side_name(side)}: {caster['name']} кастует "
-                   f"«{sp['emoji']} {sp['name']}» (слито {pool}🔮)!")
+                   f"«{sp['emoji']} {sp['name']}» (−{cost}🔮, осталось {caster['mana']}🔮)!")
     apply_spell(state, side, caster, sp, spec)
     return True
 
@@ -2636,7 +2749,8 @@ def battle_text(state: dict) -> str:
         nm = u["name"] if u else "…"
         if pend["act"] == "attack":
             hint = (f"\n\n🎯 <b>Выбор цели</b>: нажмите ВРАЖЕСКОГО юнита, которого "
-                    f"достанет {nm} (фронт В1 — всегда, либо своя/соседняя линия). "
+                    f"достанет {nm} (воин — линии в пределах ±1 от себя; "
+                    f"заклинатель — также всегда фронт врага). "
                     f"По союзнику бить нельзя. Внизу «✖ Отменить».")
         elif pend["act"] == "stealth":
             hint = (f"\n\n🗡 <b>Выбор цели скрытой атаки</b>: нажмите вражеского юнита "
@@ -2778,8 +2892,10 @@ def spell_target_error(state: dict, side: str, sp: dict, line: str, pos: int,
 MENU_TEXT = ("🏠 <b>Главное меню</b>\n\n"
              "📚 Коллекция — все ваши карты (фильтры, сортировка, 🌟 распределение очков роста)\n"
              "🃏 Колода — до 3 боевых колод; ⭐приоритетная идёт в бой без вопроса\n"
+             "📖 Книга заклинаний — справочник магии: статы, стоимость 🔮 и описание эффектов\n"
              "🎲 Получить карту — новая случайная карта\n"
              "⚔️ Бой — сражение с ботом-противником\n"
+             "👤 Профиль — ник (можно сменить), число карт, победы/ничьи/поражения\n"
              "❓ Помощь — правила игры")
 
 HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
@@ -2788,7 +2904,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • <b>Воин ⚔️</b> — ближний бой. Пары стат по системе весов (+20% к одной → −10% к парной): Атака↔Защита(КЗ), Здоровье↔Скрытность.
 • <b>Заклинатель 🔮</b> — дальние заклинания за манну. Пары: Атака↔Запас Манны, Здоровье↔Точность.
 • Карты генерируются случайно: 10 рас, по 20 имён и 20 фамилий на расу (200×200 = 4000 сочетаний). Полные имена в вашей коллекции не повторяются: при исчерпании пула добавляется римский суффикс («Торгрим Железнобород II»). Пока получение карт не ограничено.
-• ✨ РЕДКОСТИ: ⬜ Обычная (50%) / 🟩 Необычная (27%) / 🟦 Редкая (15%) / 🟪 Эпическая (6%) / 🟨 Легендарная (2%). Множитель статов ×1.00–×1.20, высокие редкости открывают сильные заклинания. Pity: 40 карт без 🟦+ → следующая гарантированно 🟦+.
+• ✨ РЕДКОСТИ: ⬜ Обычная (50%) / 🟩 Необычная (27%) / 🟦 Редкая (15%) / 🟪 Эпическая (6%) / 🟨 Легендарная (2%). Множитель статов ×1.00–×1.20, высокие редкости открывают сильные заклинания. Гарант (pity) настраивается переменной PITY_CONFIG в начале кода: порог для каждой редкости, -1 = гарант отключён. Сейчас гарант ОТКЛЮЧЁН на все редкости — только честные веса.
 • 📜 ТИТУЛЫ: с 3-го уровня в карточке коллекции можно «Даровать титул» (свой текст). Переключатель 🎭 ставит титул ПЕРЕД именем — так карта видна в бою, колодах и коллекции: «Гроза Юга» Пупкин Васильев.
 • Колоды (до 3): новые карты попадают в КОЛЛЕКЦИЮ (📚), а «🃏 Колода» открывается списком всех карт — нажатие на карту кладёт/убирает её из открытой колоды. ⭐Приоритетная колода идёт в бой без вопроса; если не выбрана — бот спросит при старте (одна непустая колода берётся сама). В бой идут первые 7 карт колоды.
 
@@ -2806,12 +2922,13 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • Клик по своему юниту → ДП: Атака / Скрытая атака / 🚶 Перемещение / Защита / Отход / ✨ Магия (у заклинателей). Режимы атаки/перемещения/магии возвращают на поле — следующий клик считается целью (есть «✖ Отменить»; бить союзника нельзя).
 • Скрытая атака всегда спрашивает подтверждение.
 • Клик по пустой клетке → 🚶 переместиться (захват) или 📥 высадить карту из колоды (на своих линиях). Вкладка «🃏 Колода» — внизу.
+• «📖 Книга заклинаний» — раздел главного меню: справочник всех заклинаний (редкость, уровень, цена 🔮, цель, описание эффекта). «👤 Профиль» — внутриигровой ник (можно сменить), число карт и статистика боёв.
 • «✨ Магия» внизу карты боя — книга заклинаний прямо с поля: сначала кастер (видно манну 🔮, выносливость ⚡ и известные заклинания), затем заклинание, затем цель.
 • 🌟 Прокачка — ТОЛЬКО после сыгранного матча: в бою зарабатываются уровни и очки роста, а распределяются они потом в «📚 Коллекция» → раздел «🌟 Ожидают повышения» (очки погибших карт не теряются). Прокачка поднимает только МАКСИМУМЫ статов — ничего не лечит и не восстанавливает.
 
 ✨ <b>МАГИЯ (40 заклинаний)</b>
 • Кастуют только ЗАКЛИНАТЕЛИ с поля; заклинания открываются по УРОВНЮ и РЕДКОСТИ карты.
-• Каст тратит ВЕСЬ (или почти весь — часть заклинаний оставляет 1🔮) пул манны, 1⚡ и всё действие хода. Маг после каста пуст — восстанавливаться в колоду; это естественный кулдаун.
+• Каст тратит СТОИМОСТЬ заклинания (🔮 из справочника), 1⚡ и всё действие хода — остаток пула сохраняется. Манна восстанавливается в колоде (+1🔮 за ход).
 • 🧱 Стена (🟦): своя передняя линия — +3 КЗ вашему тылу, заслон от скрытых атак, блокирует клетку; разрушаема (10 HP, КЗ 12).
 • 🟢 Болото (🟦): клетка врага на 3 хода — стоящий теряет 25% Атаки и 2 КЗ; уход с клетки снимает эффект.
 • ❄️ Заморозка (🟦+): цель не атакует и не кастует, КЗ=0, 1 ход. Спасбросок d20+уровень ≥ 12; иммунитет при КЗ ≥ 20.
@@ -2822,7 +2939,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 
 📐 <b>Формулы</b>
 • Попадание атаки: ПА = d20 + 3 + 2×уровень. Урон = АА × (10 + (ПА − КЗ)) // 10.
-• Обычная атака достаёт фронт врага (В1) всегда, а также любую линию, соседнюю с позицией атакующего (чтобы прорвавшихся врагов можно было бить).
+• Обычная атака ВОИНА достаёт только линии в пределах ±1 от его позиции (свою и соседние — фронт врага с С1 бьётся, с С2 уже нет: нужно перемещаться). ЗАКЛИНАТЕЛЬ дополнительно всегда достаёт фронт врага (В1) — он бьёт издалека. Прорвавшихся на ваши линии врагов можно бить (своя линия всегда в зоне ±1).
 • Скрытая атака (по тылу В2 через заслон фронта): ПСА = d20 − 3 + уровень + 2×(скрытность|точность); Урон = АА × (10 + (ПСА − КЗзаслона//2 − КЗцели)) // 10.
 • Защита: КЗ +50% до первого удара по юниту или до начала вашего следующего хода.
 • Отход: карта НАПРАВЛЯЕТСЯ в колоду и добирается туда к началу вашего следующего хода. «В пути» её КЗ вдвое ниже обычного — если противник атакует её в этот промежуток, защищаться ей тяжело. С началом вашего хода карта уже в колоде, а КЗ снова полное (штраф действует только во время отхода).
@@ -2857,6 +2974,7 @@ KB_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📚 Коллекция"), KeyboardButton(text="🃏 Колода")],
         [KeyboardButton(text="🎲 Получить карту"), KeyboardButton(text="⚔️ Бой")],
+        [KeyboardButton(text="📖 Книга заклинаний"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
@@ -2962,6 +3080,76 @@ async def msg_help(m: Message):
     await m.answer(HELP_TEXT)
 
 
+@router.message(F.text == "📖 Книга заклинаний")
+async def msg_spellbook(m: Message):
+    # Раздел главного меню: справочник ВСЕЙ магии — базовые статы
+    # (редкость, уровень, цена 🔮, цель) и чёткие описания эффектов.
+    if not await ensure_access_msg(m):
+        return
+    text, markup = spellbook_screen("all", 0)
+    await m.answer(text, reply_markup=markup)
+
+
+async def profile_screen(user_id: int):
+    # «👤 Профиль»: внутриигровой ник (можно менять), число карт и
+    # статистика боёв. Ник по умолчанию — telegram-@username.
+    p = await db_get_profile(user_id) or {}
+    cards = await db_user_cards(user_id)
+    nick = (p.get("nickname") or "").strip() or (p.get("username") or "").strip() or "Без имени"
+    text = ("👤 <b>Профиль</b>\n\n"
+            f"🏷 Ник: <b>{nick}</b>\n"
+            f"🃏 Карт в коллекции: {len(cards)}\n\n"
+            "⚔️ <b>Статистика боёв</b>\n"
+            f"🏆 Побед: {p.get('wins') or 0}\n"
+            f"🤝 Ничьих: {p.get('draws') or 0}\n"
+            f"☠️ Поражений: {p.get('losses') or 0}\n\n"
+            "<i>Побег с поля считается поражением.</i>")
+    markup = kb([ib("✏️ Сменить ник", "nick")], [ib("🏠 Меню", "mn:home")])
+    return text, markup
+
+
+@router.message(F.text == "👤 Профиль")
+async def msg_profile(m: Message):
+    if not await ensure_access_msg(m):
+        return
+    text, markup = await profile_screen(m.from_user.id)
+    await m.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("spb:"))
+async def cb_spellbook(call: CallbackQuery):
+    _, rk, page = call.data.split(":")
+    text, markup = spellbook_screen(rk, int(page) if page.isdigit() else 0)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data == "prof")
+async def cb_profile(call: CallbackQuery):
+    text, markup = await profile_screen(call.from_user.id)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data == "nick")
+async def cb_nick_ask(call: CallbackQuery):
+    # Смена ника — через флаг users.awaiting_nick (serverless: без FSM)
+    await set_user_flag(call.from_user.id, "awaiting_nick", 1)
+    await safe_answer(call)
+    await safe_edit(call, "✏️ <b>Смена ника</b>\n\nОтправьте новый внутриигровой ник "
+                    "сообщением (до 24 символов; «&lt;» «&gt;» «&amp;» будут вырезаны).\n"
+                    "Для отмены — /cancel.",
+                    kb([ib("⬅️ Отменить", "nickc")]))
+
+
+@router.callback_query(F.data == "nickc")
+async def cb_nick_cancel(call: CallbackQuery):
+    await set_user_flag(call.from_user.id, "awaiting_nick", 0)
+    await safe_answer(call, "Смена ника отменена")
+    text, markup = await profile_screen(call.from_user.id)
+    await safe_edit(call, text, markup)
+
+
 @router.message(F.text)
 async def msg_catchall(m: Message):
     # Единая точка входа для текста:
@@ -3012,6 +3200,22 @@ async def msg_catchall(m: Message):
         await m.answer(f"📜 Титул <b>«{title}»</b> дарован! Использовать его как имя — "
                        "переключатель 🎭 на карточке.\n\n" + card_text(row),
                        reply_markup=card_kb(row, "all", "0"))
+        return
+    if await user_flag(uid, "awaiting_nick"):
+        # Ждём новый внутриигровой ник («👤 Профиль» → «✏️ Сменить ник»)
+        if text.lower() in ("/cancel", "отмена"):
+            await set_user_flag(uid, "awaiting_nick", 0)
+            await m.answer("✏️ Смена ника отменена.", reply_markup=KB_MENU)
+            return
+        nick = sanitize_nick(text)
+        if not nick:
+            await m.answer("✏️ Ник не может быть пустым (символы «&lt;» «&gt;» «&amp;» "
+                           "не допускаются). Отправьте другой текст или /cancel.")
+            return
+        await set_user_flag(uid, "awaiting_nick", 0)
+        await db_set_nickname(uid, nick)
+        ptext, pmarkup = await profile_screen(uid)
+        await m.answer(f"✏️ Ник изменён на <b>{nick}</b>!\n\n{ptext}", reply_markup=pmarkup)
         return
     await m.answer(MENU_TEXT, reply_markup=KB_MENU)
 
@@ -3645,15 +3849,21 @@ async def get_new_card(user_id: int):
         if len(cards) >= MAX_DECK:
             return (f"🃏 Колода полна (максимум {MAX_DECK} карт).\nСбросьте лишние карты.",
                     kb([ib("📚 Коллекция", "col:all:0")], [ib("🏠 Меню", "mn:home")]))
-    # Pity-система (вариант 4): 40 карт подряд без «редкой+» → следующая
-    # гарантированно 🟦 редкая или выше
-    pity = await user_flag(user_id, "pity")
-    if pity >= PITY_THRESHOLD:
-        d = generate_card_data(rarity=roll_rarity(pity=True))
+    # Гарант (pity): пороги для каждой редкости задаются ПЕРЕМЕННОЙ
+    # PITY_CONFIG в начале файла; -1 = гаранта на редкость нет (сейчас
+    # отключены все). Счётчик users.pity — карты подряд ниже «🟦 редкой»;
+    # когда он достигает порога редкости R — выпадает R или выше
+    # (если порогов пройдено несколько — старшая побеждает).
+    pity_active = any(n >= 0 for n in PITY_CONFIG.values())
+    pity = await user_flag(user_id, "pity") if pity_active else 0
+    guar = pity_guarantee(pity) if pity_active else None
+    if guar:
+        d = generate_card_data(rarity=roll_rarity(rarity_rank(guar)))
         pity = 0
     else:
         d = generate_card_data()
-        pity = 0 if rarity_rank(d["rarity"]) >= 2 else pity + 1
+        if pity_active:
+            pity = 0 if rarity_rank(d["rarity"]) >= 2 else pity + 1
     # УНИКАЛЬНОСТЬ имени (правка заказчика): до 8 попыток подобрать полное
     # имя, которого у игрока ещё нет. Если все попытки дали тёзок (пул расы
     # почти исчерпан) — добавляем римский суффикс: «Торгрим Железнобород II».
@@ -3669,7 +3879,8 @@ async def get_new_card(user_id: int):
             n += 1
         d["surname"] = f"{d['surname']} {roman_numeral(n)}"
     cid = await db_add_card(user_id, d)
-    await set_user_flag(user_id, "pity", pity)
+    if pity_active:
+        await set_user_flag(user_id, "pity", pity)
     row = await db_get_card(cid, user_id)
     if d["rarity"] == "legendary":
         fanf = "🎉🟨 <b>ЛЕГЕНДАРНАЯ КАРТА!</b> 🟨🎉\n\n"
@@ -3679,8 +3890,14 @@ async def get_new_card(user_id: int):
         fanf = "✨ <b>Редкая карта!</b>\n\n"
     else:
         fanf = "🎲 <b>Новая карта получена!</b>\n\n"
-    text = (fanf + card_text(row) +
-            f"\n\n🍀 Pity: {pity}/{PITY_THRESHOLD} до гарантированной 🟦 Редкой."
+    # Строка гаранта — только если хоть один порог в PITY_CONFIG включён
+    active = {r: n for r, n in PITY_CONFIG.items() if n >= 0}
+    if active:
+        nearest = min(active.values())
+        pity_line = f"\n\n🍀 Гарант: {pity}/{nearest} до гарантированной редкости."
+    else:
+        pity_line = ""
+    text = (fanf + card_text(row) + pity_line +
             "\n💡 Колоды пусты — откройте «🃏 Колода» и нажмите на карты, "
             "которые возьмёте в бой (колод до 3).")
     markup = kb([ib("🎲 Ещё одну", "getc")],
@@ -3855,6 +4072,12 @@ async def end_battle(user_id: int, state: dict) -> bool:
             hp = u["hp_max"] if HEAL_AFTER_BATTLE else u["hp"]
         await db_sync_card_after_battle(u, hp)
     await db_delete_battle(user_id)
+    # Статистика боёв для «👤 Профиль» — ПОСЛЕ удаления боя: повторная
+    # финализация при сбое не найдёт бой в БД → счётчик не удвоится.
+    # Побег считается поражением (RESULT_COL).
+    if not state.get("result_recorded"):
+        state["result_recorded"] = True
+        await db_add_result(user_id, state["result"])
     if HEAL_AFTER_BATTLE and lost < len(units):
         lines.append("❤️ Выжившие карты вылечены.")
     total_pend = pending_levels_total(state)
@@ -4040,7 +4263,7 @@ async def resolve_pending_cell(call: CallbackQuery, state: dict, pend: dict,
 async def show_attacker_choice(call: CallbackQuery, state: dict, line: str, pos: int, tgt: dict):
     # «Предлагает атаковать — можно выбрать кем» (клик по вражескому юниту).
     # Для каждого своего юнита показываем доступные виды удара:
-    # ⚔️ обычная (фронт В1 всегда + своя/соседняя линия) и 🗡 скрытая (только В2).
+    # ⚔️ обычная (воин: ±1 линия от себя; маг: также фронт врага) и 🗡 скрытая (только В2).
     btns = []
     for _, _, a in board_units(state, "player"):
         if a["end"] <= 0:
@@ -4177,8 +4400,9 @@ async def cb_enter_attack_mode(call: CallbackQuery):
     has_target = any(can_normal_attack(u, tl)
                      for tl, _, t in board_units(state, "enemy"))
     if not has_target:
-        await safe_answer(call, "Нет целей, которых достанет обычная атака "
-                          "(фронт В1 или своя/соседняя линия).", show_alert=True)
+        await safe_answer(call, "Нет целей в зоне досягаемости (воин: линии в "
+                          "пределах ±1 от себя; заклинатель: также фронт врага).",
+                          show_alert=True)
         return
     state["pending"] = {"act": "attack", "uid": uid}
     await db_save_battle(call.from_user.id, state)
@@ -4333,11 +4557,16 @@ async def cb_spellbook(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("SP:"))
 async def cb_spell_menu(call: CallbackQuery):
-    # Книга заклинаний мага: что открыто по уровню и редкости
+    # Книга заклинаний мага в бою: заклинания с БАЗОВЫМИ СТАТАМИ и описанием
+    # действия (правка заказчика), постранично — легендарный маг высокого
+    # уровня знает до 40 штук. Каст тратит СТОИМОСТЬ заклинания (🔮 min_mana),
+    # 1⚡ и всё действие хода — остаток пула сохраняется у мага.
     state = await load_active_battle(call)
     if not state:
         return
-    uid = int(call.data.split(":")[1])
+    parts = call.data.split(":")
+    uid = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
     u = await get_board_unit(call, state, uid)
     if u is None:
         return
@@ -4350,16 +4579,29 @@ async def cb_spell_menu(call: CallbackQuery):
                           f"(сейчас L{u['level']}, {rarity_label(u.get('rarity', 'common'))}).",
                           show_alert=True)
         return
+    n_pages = max(1, (len(known) + SPELLS_PER_PAGE - 1) // SPELLS_PER_PAGE)
+    page = max(0, min(page, n_pages - 1))
+    chunk = known[page * SPELLS_PER_PAGE:(page + 1) * SPELLS_PER_PAGE]
     await safe_answer(call)
-    text = (unit_info(u) + "\n\n✨ <b>Книга заклинаний</b> — каст тратит ВЕСЬ пул манны, "
-            "1⚡ и всё действие хода. 🔒 — пока недоступно (уровень/редкость/манна):")
+    text = (f"✨ <b>Книга заклинаний</b> — {u['name']} · {u['mana']}/{u['mana_max']}🔮 · "
+            f"⚡{u['end']}/{u['end_max']}\n"
+            "Каст тратит стоимость заклинания (🔮), 1⚡ и всё действие хода. "
+            f"Стр. {page + 1}/{n_pages} · 🔒 — пока недоступно:\n\n"
+            + "\n\n".join(spell_line(sid) + ("" if spell_available(u, SPELLS[sid]) else " 🔒")
+                          for sid in chunk))
     rows = []
-    for sid in known:
+    for sid in chunk:
         sp = SPELLS[sid]
         lock = "" if spell_available(u, sp) else "🔒"
         rows.append([ib(f"{sp['emoji']} {lock}{sp['name']} · L{sp['lvl']} · ≥{sp['min_mana']}🔮",
                         f"SPL:{uid}:{sid}")])
-    rows.append([ib("⬅️ Назад", f"UM:{uid}")])
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️", f"SP:{uid}:{page - 1}"))
+    nav.append(ib("⬅️ Назад", f"UM:{uid}"))
+    if page < n_pages - 1:
+        nav.append(ib("▶️", f"SP:{uid}:{page + 1}"))
+    rows.append(nav)
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -4391,7 +4633,8 @@ async def cb_spell_pick(call: CallbackQuery):
         scope = {"all_enemies": "ВСЕМ врагам", "all_allies": "ВСЕМ союзникам",
                  "all_enemy_cells": "ВСЕМ клеткам врага"}[t]
         text = (f"{sp['emoji']} <b>«{sp['name']}»</b> — {scope}.\n{sp['desc']}\n\n"
-                f"Слить ВЕСЬ пул ({u['mana']}🔮) и ход на этот каст? Уверены?")
+                f"Потратить {sp['min_mana']}🔮 (останется {u['mana'] - sp['min_mana']}) "
+                f"и ход на этот каст? Уверены?")
         await safe_edit(call, text, kb([ib("✅ Да, уверен(а)", f"SPC:{uid}:{sid}")],
                                        [ib("✖ Нет", f"UM:{uid}")]))
         return
@@ -4790,7 +5033,8 @@ def admin_text() -> str:
     return ("🛠 <b>Админ-панель</b>\n\n"
             "🎲 Выдать карту — любая редкость, сразу в колоду №1\n"
             "⬆️ Прокачать — +1/+5/+10 уровней или «до 10»; очки роста можно "
-            "распределить вручную 🎯 (как в бою) или применить автоматически 🎲\n"
+            "распределить вручную 🎯 или применить автоматически 🎲 "
+            "(прокачка ничего не лечит и не восстанавливает)\n"
             "✨ Редкость — изменить грейд карты\n"
             "🗑 Удалить карту\n"
             "❤️ Вылечить все карты\n"
