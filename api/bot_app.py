@@ -143,6 +143,64 @@ PITY_CONFIG = {
     "legendary": -1,
 }
 
+# =====================================================================
+# ФОРМУЛЫ БОЯ — все коэффициенты собраны ЗДЕСЬ (правка заказчика).
+# Урон больше не зашит целочисленной арифметикой в коде: переменные
+# динамически подставляются в формулу
+#     УРОН = АА × (1 + dmg_step × (попадание − КЗ)),
+# где попадание — ПА обычной атаки или ПСА скрытой.
+# dmg_step — та самая «0,1 перед скобкой разницы»: меняется в одном месте.
+# =====================================================================
+FORMULAS = {
+    # Попадание атаки (ПА) = d20 + pa_base + pa_level × уровень (+ преимущество)
+    "pa_base": 3,        # фиксированный бонус ПА
+    "pa_level": 2,       # бонус ПА за каждый уровень юнита
+    "adv": 2,            # бонус преимущества к ПА (атака при появлении, «Ускорение»)
+    # Попадание скрытой атаки (ПСА) = d20 + psa_base + psa_level × уровень
+    #                                  + psa_sub × (скрытность | точность)
+    "psa_base": -3,      # фиксированный штраф ПСА
+    "psa_level": 1,      # бонус ПСА за уровень
+    "psa_sub": 2,        # бонус ПСА за очко скрытности/точности
+    # Спасбросок от контроля = d20 + save_level × уровень ≥ DC
+    "save_level": 1,
+    # Множитель урона: (1 + dmg_step × разница), снизу ограничен dmg_min.
+    "dmg_step": 0.1,     # шаг множителя за 1 пункт разницы (попадание − КЗ)
+    "dmg_min": 0.0,      # пол: урон не бывает отрицательным
+}
+
+# ФЛАГ режима расчёта урона (правка заказчика):
+#   "dynamic" — множитель (1 + dmg_step × разница) считается с плавающей
+#               точностью: ПА чуть ниже КЗ УМЕНЬШАЕТ урон плавно (×0.9, ×0.5…),
+#               а в ноль он уходит, только когда множитель стал ≤ 0
+#               (при dmg_step = 0.1 — разница −10 и хуже);
+#   "classic" — прежний целочисленный расчёт × (10 + разница) // 10:
+#               ЛЮБОЕ попадание ниже КЗ сразу обнуляет урон.
+DAMAGE_MODE = "dynamic"
+
+
+def dmg_multiplier(diff: int, cap=None) -> float:
+    # Множитель урона по формуле FORMULAS/DAMAGE_MODE.
+    # diff = попадание − КЗ (для скрытой: ПСА − КЗ_заслона//2 − КЗ_цели),
+    # cap  = потолок множителя (обычные/заклинания ×2, пробитие ×1;
+    #        None — без потолка, как у скрытой атаки).
+    if DAMAGE_MODE == "classic":
+        m = float((10 + diff) // 10)              # старая целочисленная формула
+    else:
+        m = 1.0 + FORMULAS["dmg_step"] * diff     # АА × (1 + 0.1 × (ПА − КЗ))
+    m = max(FORMULAS["dmg_min"], m)
+    if cap is not None:
+        m = min(float(cap), m)
+    return m
+
+
+def dmg_calc(base: int, mult: float) -> int:
+    # УРОН = база (АА × coef_pct%) × множитель, округление ВНИЗ.
+    # Добавка 1e-9 компенсирует погрешность двоичного представления
+    # float (например, 1 + 0.1×(−6) = 0.3999999… вместо 0.4 — без неё
+    # урон 10×0.4 посчитался бы как 3).
+    return max(0, int(base * mult + 1e-9))
+
+
 
 def rarity_rank(r: str) -> int:
     return RARITY_INFO.get(r, RARITY_INFO["common"])["rank"]
@@ -155,21 +213,49 @@ def rarity_label(r: str) -> str:
 # КОЛОДЫ (до 3), ОТОБРАЖЕНИЕ КАРТ И СОРТИРОВКА КОЛЛЕКЦИИ
 # =====================================================================
 
-# Сколько колод может собрать игрок. Колода карты хранится прямо в
-# cards.in_deck: 0 — вне колод, 1/2/3 — номер колоды (старые данные с
-# in_deck=1 автоматически считаются колодой №1 — миграция не нужна).
+# Сколько колод может собрать игрок. cards.in_deck — БИТОВАЯ МАСКА (правка
+# заказчика): бит колоды №n = 1 << (n−1), т.е. №1 = 1 (001), №2 = 2 (010),
+# №3 = 4 (100); 0 = вне колод, 7 = карта сразу во всех трёх.
+# ОДНА И ТА ЖЕ КАРТА МОЖЕТ ЛЕЖАТЬ В НЕСКОЛЬКИХ КОЛОДАХ ОДНОВРЕМЕННО.
+# Старые данные: 1 и 2 уже совпадают с битами колод №1/№2, а старое
+# «3 = колода №3» переносится в 4 миграцией v2.3 (см. migration_v2.sql).
 DECK_COUNT = 3
+
+
+def deck_bit(n: int) -> int:
+    # Бит маски in_deck для колоды №n (нумерация с 1)
+    return 1 << (max(1, min(int(n), DECK_COUNT)) - 1)
+
+
+def card_decks(c) -> list:
+    # Номера ВСЕХ колод, в которых лежит карта (маска in_deck)
+    m = c["in_deck"] or 0
+    return [n for n in range(1, DECK_COUNT + 1) if m & deck_bit(n)]
+
+
+def decks_mark(c) -> str:
+    # Значок карты для списков: «✅1·3» — в колодах №1 и №3, «🔸2» — только
+    # в чужой колоде №2 (вызывается, когда в текущей её нет), «➖» — вне колод.
+    ns = card_decks(c)
+    return f"✅{'·'.join(str(n) for n in ns)}" if ns else "➖"
 
 # С какого уровня можно даровать титул (кнопка в карточке коллекции)
 TITLE_MIN_LEVEL = 3
 
 # Критерии сортировки коллекции: (код, подпись). Код с «-» на конце —
 # по убыванию. По умолчанию — 📅 дата получения (id, как раньше).
-SORTS = [("id", "📅 Дата получения"), ("rar", "✨ Редкость"), ("lvl", "⭐ Уровень"),
+SORTS = [("id", "📅 Дата получения"), ("pwr", "💪 Главная стата"),
+         ("rar", "✨ Редкость"), ("lvl", "⭐ Уровень"),
          ("atk", "⚔️ Атака"), ("def", "🛡 Защита"), ("hp", "❤️ Здоровье"),
          ("mna", "🔮 Запас манны"), ("end", "⚡ Выносливость"),
          ("sub", "🥷 Скрытность/🎯 Точность"), ("cls", "🧬 Класс"),
          ("rac", "🎭 Раса"), ("nm", "🔤 Имя")]
+
+# Режим сборки колоды («🧩 Собрать колоду»): сортировка ПО УМОЛЧАНИЮ —
+# от большего к меньшему (правка заказчика), по главной стате карты.
+BUILDER_DEFAULT_SORT = "pwr-"
+# f-параметр экрана сборки по умолчанию (фильтр «все» + сортировка выше)
+BUILDER_DEFAULT_SORT_F = "all~" + BUILDER_DEFAULT_SORT
 
 
 def sanitize_title(text: str) -> str:
@@ -257,6 +343,7 @@ def sort_cards(cards, s: str):
     desc = s.endswith("-")
     keyf = {
         "id":  lambda c: c["id"],
+        "pwr": lambda c: main_stat(c["cls"], c["attack"], c["armor"])[1],
         "rar": lambda c: rarity_rank(c.get("rarity") or "common"),
         "lvl": lambda c: c["level"],
         "atk": lambda c: c["attack"],
@@ -275,8 +362,11 @@ def sort_cards(cards, s: str):
 
 
 def decks_of(cards) -> dict:
-    # Раскладывает карты по колодам {1: [...], 2: [...], 3: [...]}
-    return {n: [c for c in cards if c["in_deck"] == n] for n in range(1, DECK_COUNT + 1)}
+    # Раскладывает карты по колодам {1: [...], 2: [...], 3: [...]}.
+    # in_deck — битовая маска: одна карта может лежать в нескольких колодах,
+    # тогда она попадёт в каждый соответствующий список.
+    return {n: [c for c in cards if (c["in_deck"] or 0) & deck_bit(n)]
+            for n in range(1, DECK_COUNT + 1)}
 
 # =====================================================================
 # РАССЫ И ИМЕНА
@@ -604,12 +694,14 @@ async def db_user_cards(user_id: int):
 
 
 async def db_battle_cards(user_id: int, deck: int = 1):
-    # Карты выбранной колоды (in_deck = номер колоды 1..3) — именно они
-    # идут в бой (не больше MAX_DECK, первые по id)
+    # Карты выбранной колоды: in_deck — БИТОВАЯ МАСКА (бит колоды №n),
+    # а PostgREST не умеет побитовые фильтры — читаем всю коллекцию
+    # (отсортирована по id) и отбираем битом в коде. В бой идут не
+    # больше MAX_DECK первых карт.
     deck = max(1, min(int(deck), DECK_COUNT))
-    return await _rest("GET", "cards", params={
-        "user_id": f"eq.{user_id}", "in_deck": f"eq.{deck}", "select": "*",
-        "order": "id.asc", "limit": str(MAX_DECK)})
+    bit = deck_bit(deck)
+    cards = await db_user_cards(user_id)
+    return [c for c in cards if (c.get("in_deck") or 0) & bit][:MAX_DECK]
 
 
 async def db_name_taken(user_id: int, name: str, surname: str) -> bool:
@@ -628,7 +720,8 @@ async def db_admin_heal_all(user_id: int):
 
 
 async def db_set_in_deck(card_id: int, val: int):
-    # val: 0 — вне колод, 1..DECK_COUNT — номер колоды
+    # val — БИТОВАЯ МАСКА колод: бит №n = 1<<(n−1) (0 = вне колод,
+    # 7 = во всех трёх). Одна карта может лежать в нескольких колодах.
     await _rest("PATCH", "cards", params={"id": f"eq.{card_id}"},
                 json_body={"in_deck": val})
 
@@ -1189,15 +1282,18 @@ def atk_eff(u: dict, state: dict = None) -> int:
 
 
 def attack_roll(unit: dict, advantage: int = 0):
-    # Попадание Атаки (ПА) = d20 + 3 + 2×уровень  (+2 при преимуществе, план п.3.7)
+    # Попадание Атаки (ПА) = d20 + pa_base + pa_level×уровень (+ преимущество).
+    # Коэффициенты — переменные FORMULAS в начале файла (легко менять).
     roll = d20()
-    return roll, roll + 3 + 2 * unit["level"] + advantage
+    return roll, roll + FORMULAS["pa_base"] + FORMULAS["pa_level"] * unit["level"] + advantage
 
 
 def stealth_roll(unit: dict):
-    # Попадание Скрытой Атаки (ПСА) = d20 − 3 + уровень + 2×(скрытность|точность)
+    # Попадание Скрытой Атаки (ПСА) = d20 + psa_base + psa_level×уровень
+    # + psa_sub×(скрытность|точность) — коэффициенты из FORMULAS.
     roll = d20()
-    return roll, roll - 3 + unit["level"] + 2 * unit["sub"]
+    return (roll, roll + FORMULAS["psa_base"] + FORMULAS["psa_level"] * unit["level"]
+            + FORMULAS["psa_sub"] * unit["sub"])
 
 
 def gain_xp(state: dict, u: dict, amount: int):
@@ -1348,13 +1444,14 @@ def resolve_attack(state: dict, atk: dict, tgt_line: str, tgt_pos: int,
     # pierce — магическое пробитие: КЗ цели считается как eff_armor//2.
     # coef_pct — коэффициент урона в % (шквал 50, метеор 150...).
     # cap — потолок множителя (для заклинаний = 2, «кнопки победы» нет).
+    # УРОН считается ДИНАМИЧЕСКИ по формулам из FORMULAS/DAMAGE_MODE:
+    # множитель = 1 + dmg_step × (попадание − КЗ), урон = АА × множитель.
     label = ROW_LABEL[tgt_line]
     who = side_name(atk["side"])
-    # БАЛАНС МАГИИ (док. «ж»): физическая атака вариативна (множитель 0–2),
-    # а заклинания дают СТАБИЛЬНЫЙ множитель ×1, но пробивают половину КЗ.
-    # Итог: против «толстяков» с высоким КЗ (обычная атака бьёт на 0) магия
-    # незаменима, а против равных — не превосходит обычные атаки и не
-    # является «кнопкой победы» (проверяется в test_spells.py).
+    # БАЛАНС МАГИИ (док. «ж»): физическая атака вариативна (множитель
+    # ограничен cap), а заклинания пробивают половину КЗ при потолке ×1 —
+    # против «толстяков» с высоким КЗ магия незаменима, а против равных
+    # не является «кнопкой победы» (проверяется в test_spells.py).
     if pierce:
         cap = 1
 
@@ -1365,8 +1462,8 @@ def resolve_attack(state: dict, atk: dict, tgt_line: str, tgt_pos: int,
             return  # пустые клетки больше не «атакуются» — на них перемещаются
         # Удар по СТЕНЕ: у стены свои HP и КЗ, она разрушаема
         roll, pa = attack_roll(atk, advantage)
-        mult = min(cap, max(0, (10 + pa - wall["armor"]) // 10))
-        dmg = max(0, atk_eff(atk, state) * coef_pct // 100 * mult)
+        mult = dmg_multiplier(pa - wall["armor"], cap)
+        dmg = dmg_calc(atk_eff(atk, state) * coef_pct // 100, mult)
         wall["hp"] -= dmg
         log_add(state, f"🧱 Удар по стене ({label}:{tgt_pos}): d20={roll}, ПА={pa} "
                        f"против КЗ стены {wall['armor']} → урон {dmg}, у стены HP {max(0, wall['hp'])}")
@@ -1377,30 +1474,30 @@ def resolve_attack(state: dict, atk: dict, tgt_line: str, tgt_pos: int,
 
     if stealth:
         # СКРЫТАЯ АТАКА (план п.3.4) — удар через первую линию по тылу.
-        # Исправленная формула: УРОН = АА × (10 + (ПСА − ПЗ1//2 − ПЗ2)) // 10.
+        # УРОН = АА × (1 + dmg_step × (ПСА − КЗ_заслона//2 − КЗ_цели)).
         blocker = find_blocker(state, tgt["side"], tgt_pos)
         pz1 = eff_armor(blocker, state) if blocker else 0
         roll, psa = stealth_roll(atk)
         kz2 = eff_armor(tgt, state)
-        mult = (10 + psa - pz1 // 2 - kz2) // 10
-        dmg = max(0, atk_eff(atk, state) * coef_pct // 100 * mult)
+        mult = dmg_multiplier(psa - pz1 // 2 - kz2)
+        dmg = dmg_calc(atk_eff(atk, state) * coef_pct // 100, mult)
         bl_txt = f"{blocker['name']} КЗ={pz1}" if blocker else "заслона нет"
         log_add(state, f"🗡 {who}: {atk['name']} → {tgt['name']} СКРЫТАЯ атака ({label}:{tgt_pos}): "
                        f"d20={roll}, ПСА={psa}, заслон ({bl_txt})//2, КЗ цели={kz2} "
-                       f"→ урон {atk_eff(atk, state)}×{mult} = {dmg}")
+                       f"→ урон {atk_eff(atk, state)}×{mult:g} = {dmg}")
     else:
-        # ОБЫЧНАЯ АТАКА (план п.3.3): УРОН = АА × (10 + (ПА − КЗ)) // 10.
+        # ОБЫЧНАЯ АТАКА (план п.3.3): УРОН = АА × (1 + dmg_step × (ПА − КЗ)).
         roll, pa = attack_roll(atk, advantage)
         kz = eff_armor(tgt, state)
         if pierce:
             kz = kz // 2   # магия пробивает половину КЗ
-        mult = min(cap, max(0, (10 + pa - kz) // 10))
-        dmg = max(0, atk_eff(atk, state) * coef_pct // 100 * mult)
-        adv_txt = " с преимуществом (+2 к ПА)" if advantage else ""
+        mult = dmg_multiplier(pa - kz, cap)
+        dmg = dmg_calc(atk_eff(atk, state) * coef_pct // 100, mult)
+        adv_txt = f" с преимуществом (+{advantage} к ПА)" if advantage else ""
         pierce_txt = " (пробитие: КЗ//2)" if pierce else ""
         log_add(state, f"⚔️ {who}: {atk['name']} → {tgt['name']} ({label}:{tgt_pos}){adv_txt}{pierce_txt}: "
                        f"d20={roll}, ПА={pa} против КЗ={kz} "
-                       f"→ урон {atk_eff(atk, state)}×{mult} = {dmg}")
+                       f"→ урон {atk_eff(atk, state)}×{mult:g} = {dmg}")
 
     # Магический щит поглощает урон первым
     shield = fx_sum(tgt, "shield")
@@ -1435,16 +1532,16 @@ def resolve_attack(state: dict, atk: dict, tgt_line: str, tgt_pos: int,
 # ---------- действия (ДП) и действие игрока (ДИ) ----------
 
 def perform_attack(state: dict, side: str, u: dict, tgt_line: str, tgt_pos: int,
-                   stealth: bool, free: bool = False):
+                   stealth: bool, free: bool = False, advantage: int = 0):
     # free=True — только для автоматической атаки при появлении (план п.3.7):
-    # она не тратит ни выносливость, ни манну, ни отдельное ДИ.
-    advantage = 0
+    # она не тратит ни выносливость, ни манну, ни отдельное ДИ
+    # (преимущество к ПА ей передаёт вызывающий код — FORMULAS["adv"]).
     if not free:
         u["end"] -= 1  # выносливость тратится на каждое ДП (план п.3.6)
         if u["cls"] == CLS_MAGE:
             u["mana"] -= MAGE_STEALTH_MANA if stealth else MAGE_ATTACK_MANA
         u["acted_this_turn"] = True
-        # Эффект «Ускорения»: следующая атака с преимуществом +2 — тратится
+        # Эффект «Ускорения»: следующая атака с преимуществом — тратится
         if has_fx(u, "adv_next"):
             advantage += fx_sum(u, "adv_next")
             remove_fx(u, "adv_next")
@@ -1512,7 +1609,8 @@ def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
 
     # АТАКА ПРИ ПОЯВЛЕНИИ (план п.3.7 + правка заказчика «только между
     # раундами»): воин, появляясь на поле, автоматически бьёт с
-    # преимуществом (+2 к ПА) врага на передней линии противника — но
+    # преимуществом (+FORMULAS["adv"] к ПА, по умолчанию +2) врага на
+    # передней линии противника — но
     # ТОЛЬКО если этот враг не совершал действий в свой прошлый ход
     # (acted_this_turn=False) и фронт в пределах досягаемости воина
     # (±1 линии — общее правило дальности). Цель — клетка прямо напротив
@@ -1536,8 +1634,9 @@ def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
                 target = min(idle, key=lambda pt: (abs(pos + pt[0] - 4), pt[0]))
             log_add(state, f"✨ Атака при появлении! {u['name']} застигает "
                            f"{target[1]['name']} врасплох (та не действовала в прошлый "
-                           f"ход) — преимущество +2 к ПА.")
-            perform_attack(state, side, u, front_line, target[0], stealth=False, free=True)
+                           f"ход) — преимущество +{FORMULAS['adv']} к ПА.")
+            perform_attack(state, side, u, front_line, target[0], stealth=False,
+                           free=True, advantage=FORMULAS["adv"])
 
 
 # ---------- ходы, победа/поражение ----------
@@ -1930,9 +2029,9 @@ def spells_for_unit(u: dict):
 
 
 def saving_throw(state: dict, u: dict, dc: int) -> bool:
-    # Спасбросок от контроля: d20 + уровень ≥ DC
+    # Спасбросок от контроля: d20 + save_level × уровень ≥ DC (коэффициент — FORMULAS)
     roll = d20()
-    ok = roll + u["level"] >= dc
+    ok = roll + FORMULAS["save_level"] * u["level"] >= dc
     log_add(state, f"🎲 Спасбросок {u['name']}: d20={roll}+ур{u['level']} против {dc} → "
                    f"{'сопротивился' if ok else 'НЕ смог'}")
     return ok
@@ -2155,8 +2254,9 @@ def apply_spell(state: dict, side: str, caster: dict, sp: dict, spec):
         u = spec_unit()
         if u:
             u["end"] = u["end_max"]
-            add_fx(u, "adv_next", 2, 4)
-            log_add(state, f"💨 {u['name']} ускорен: ⚡ восстановлена, следующая атака +2 ПА.")
+            add_fx(u, "adv_next", FORMULAS["adv"], 4)
+            log_add(state, f"💨 {u['name']} ускорен: ⚡ восстановлена, следующая атака "
+                           f"+{FORMULAS['adv']} ПА.")
 
     # --- контроль ---
     elif kind == "freeze":
@@ -2891,7 +2991,7 @@ def spell_target_error(state: dict, side: str, sp: dict, line: str, pos: int,
 
 MENU_TEXT = ("🏠 <b>Главное меню</b>\n\n"
              "📚 Коллекция — все ваши карты (фильтры, сортировка, 🌟 распределение очков роста)\n"
-             "🃏 Колода — до 3 боевых колод; ⭐приоритетная идёт в бой без вопроса\n"
+             "🃏 Колода — до 3 боевых колод («🧩 Собрать колоду»); карта может лежать в нескольких колодах; ⭐приоритетная идёт в бой без вопроса\n"
              "📖 Книга заклинаний — справочник магии: статы, стоимость 🔮 и описание эффектов\n"
              "🎲 Получить карту — новая случайная карта\n"
              "⚔️ Бой — сражение с ботом-противником\n"
@@ -2906,7 +3006,7 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • Карты генерируются случайно: 10 рас, по 20 имён и 20 фамилий на расу (200×200 = 4000 сочетаний). Полные имена в вашей коллекции не повторяются: при исчерпании пула добавляется римский суффикс («Торгрим Железнобород II»). Пока получение карт не ограничено.
 • ✨ РЕДКОСТИ: ⬜ Обычная (50%) / 🟩 Необычная (27%) / 🟦 Редкая (15%) / 🟪 Эпическая (6%) / 🟨 Легендарная (2%). Множитель статов ×1.00–×1.20, высокие редкости открывают сильные заклинания. Гарант (pity) настраивается переменной PITY_CONFIG в начале кода: порог для каждой редкости, -1 = гарант отключён. Сейчас гарант ОТКЛЮЧЁН на все редкости — только честные веса.
 • 📜 ТИТУЛЫ: с 3-го уровня в карточке коллекции можно «Даровать титул» (свой текст). Переключатель 🎭 ставит титул ПЕРЕД именем — так карта видна в бою, колодах и коллекции: «Гроза Юга» Пупкин Васильев.
-• Колоды (до 3): новые карты попадают в КОЛЛЕКЦИЮ (📚), а «🃏 Колода» открывается списком всех карт — нажатие на карту кладёт/убирает её из открытой колоды. ⭐Приоритетная колода идёт в бой без вопроса; если не выбрана — бот спросит при старте (одна непустая колода берётся сама). В бой идут первые 7 карт колоды.
+• Колоды (до 3): новые карты попадают в КОЛЛЕКЦИЮ (📚). «🃏 Колода» показывает состав, а «🧩 Собрать колоду» открывает режим сборки: вверху — карты, уже добавленные в эту колоду, внизу — вся коллекция со статами, фильтрами и сортировкой (по умолчанию от большего к меньшему). Нажатие на карту добавляет/убирает её в ЭТОЙ колоде — одна и та же карта может лежать в нескольких колодах сразу. ⭐Приоритетная колода идёт в бой без вопроса; если не выбрана — бот спросит при старте (одна непустая колода берётся сама). В бой идут первые 7 карт колоды.
 
 ⚔️ <b>Поле боя — 4 клетки и 4 линии</b>
 • Линии сверху вниз: В2 (тыл врага), В1 (фронт врага), С1 (ваш фронт), С2 (ваш тыл). У каждой стороны по 4 клетки, максимум 3 на линию. Раскладки: 3+1, 2+2 или 1+3.
@@ -2938,14 +3038,14 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • За ход доступно ОДНО действие: ДП юнита (атака/скрытая/перемещение/защита/отход/магия) ИЛИ высадка карты из колоды. Действия не накапливаются.
 
 📐 <b>Формулы</b>
-• Попадание атаки: ПА = d20 + 3 + 2×уровень. Урон = АА × (10 + (ПА − КЗ)) // 10.
+• Попадание атаки: ПА = d20 + 3 + 2×уровень. Урон = АА × (1 + 0,1×(ПА − КЗ)) — множитель считается ДИНАМИЧЕСКИ с плавающей точкой (режим DAMAGE_MODE="dynamic"): ПА чуть ниже КЗ уменьшает урон (×0,9, ×0,5…), а не обнуляет его; 0 урона — когда множитель стал ≤ 0 (разница −10 и хуже). Все коэффициенты (3, 2, 0,1 и т.д.) — переменные FORMULAS в начале кода.
 • Обычная атака ВОИНА достаёт только линии в пределах ±1 от его позиции (свою и соседние — фронт врага с С1 бьётся, с С2 уже нет: нужно перемещаться). ЗАКЛИНАТЕЛЬ дополнительно всегда достаёт фронт врага (В1) — он бьёт издалека. Прорвавшихся на ваши линии врагов можно бить (своя линия всегда в зоне ±1).
-• Скрытая атака (по тылу В2 через заслон фронта): ПСА = d20 − 3 + уровень + 2×(скрытность|точность); Урон = АА × (10 + (ПСА − КЗзаслона//2 − КЗцели)) // 10.
+• Скрытая атака (по тылу В2 через заслон фронта): ПСА = d20 − 3 + уровень + 2×(скрытность|точность); Урон = АА × (1 + 0,1×(ПСА − КЗзаслона//2 − КЗцели)).
 • Защита: КЗ +50% до первого удара по юниту или до начала вашего следующего хода.
 • Отход: карта НАПРАВЛЯЕТСЯ в колоду и добирается туда к началу вашего следующего хода. «В пути» её КЗ вдвое ниже обычного — если противник атакует её в этот промежуток, защищаться ей тяжело. С началом вашего хода карта уже в колоде, а КЗ снова полное (штраф действует только во время отхода).
 
 ✨ <b>Атака при появлении — только между раундами!</b>
-• Воин, выходя из колоды, автоматически бьёт с преимуществом (+2 к ПА) врага на передней линии — НО только если этот враг НЕ совершал действий в свой прошлый ход («застал врасплох»).
+• Воин, выходя из колоды, автоматически бьёт с преимуществом (+2 к ПА — переменная FORMULAS['adv']) врага на передней линии — НО только если этот враг НЕ совершал действий в свой прошлый ход («застал врасплох»).
 • Поэтому в первом раунде, когда обе стороны только выставляют карты, бонус не срабатывает: свежая карта считается уже действовавшей.
 • Бонус не тратит ни выносливость, ни манну.
 
@@ -2958,6 +3058,66 @@ HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
 • 🌟 Опыт за убийства и итог боя; уровень поднимает попадание сразу, а очко статы вы распределяете сами.
 
 <b>Обозначения на карте</b>: 👹 вражеский юнит/стена · 🔰 держит защиту · 💤 истощён · ❄️ заморожен · ⏳ временная петля · 🧱 стена · 🟢 болото · ⬜ пустая клетка · ▫️ клетки нет."""
+
+
+# ---------------------------------------------------------------------
+# ПАГИНАЦИЯ ПОМОЩИ (баг-фикс заказа: «TelegramBadRequest: message is
+# too long»). Лимит сообщения Telegram — 4096 символов, а HELP_TEXT
+# разросся больше него. Поэтому помощь режется на страницы ПО АБЗАЦАМ
+# (блоки, разделённые пустой строкой; слишком длинный абзац — по строкам):
+# «❓ Помощь» открывает страницу 1, листание — кнопки ◀️/▶️ (hlp:{стр}).
+# ---------------------------------------------------------------------
+
+HELP_PAGE_LIMIT = 3800   # запас к лимиту 4096 — на «хвост» страницы и разметку
+
+
+def pack_pages(text: str, limit: int = HELP_PAGE_LIMIT) -> list:
+    # Жадная упаковка абзацев текста в страницы не длиннее limit.
+    # Гарантируется: каждая страница ≤ limit и исходный текст
+    # восстанавливается как "\n\n".join(страницы).
+    pages, cur = [], ""
+    for para in text.split("\n\n"):
+        block = para if not cur else cur + "\n\n" + para
+        if len(block) <= limit:
+            cur = block
+            continue
+        if cur:
+            pages.append(cur)
+            cur = ""
+        if len(para) <= limit:
+            cur = para
+            continue
+        for ln in para.split("\n"):     # абзац длиннее страницы — режем по строкам
+            while len(ln) > limit:      # строка длиннее страницы — жёсткий рез
+                pages.append((cur + "\n" if cur else "") + ln[:limit])
+                cur = ""
+                ln = ln[limit:]
+            block = ln if not cur else cur + "\n" + ln
+            if len(block) <= limit:
+                cur = block
+            else:
+                if cur:
+                    pages.append(cur)
+                cur = ln
+    if cur:
+        pages.append(cur)
+    return pages
+
+
+HELP_PAGES = pack_pages(HELP_TEXT)
+
+
+def help_screen(page: int = 0):
+    # Страница помощи: текст + «📄 Стр. X/Y» + навигация ◀️/▶️ + меню.
+    page = max(0, min(int(page), len(HELP_PAGES) - 1))
+    text = HELP_PAGES[page] + f"\n\n📄 Стр. {page + 1}/{len(HELP_PAGES)}"
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️ Назад", f"hlp:{page - 1}"))
+    nav.append(ib("🏠 Меню", "mn:home"))
+    if page < len(HELP_PAGES) - 1:
+        nav.append(ib("Дальше ▶️", f"hlp:{page + 1}"))
+    return text, InlineKeyboardMarkup(inline_keyboard=[nav])
 
 
 # =====================================================================
@@ -3075,9 +3235,22 @@ async def msg_battle(m: Message):
 
 @router.message(F.text == "❓ Помощь")
 async def msg_help(m: Message):
+    # Баг-фикс заказа («message is too long»): HELP_TEXT длиннее лимита
+    # Telegram 4096 символов — помощь выдаётся СТРАНИЦАМИ (HELP_PAGES),
+    # листание кнопками ◀️/▶️ (колбэк hlp:{страница}).
     if not await ensure_access_msg(m):
         return
-    await m.answer(HELP_TEXT)
+    text, markup = help_screen(0)
+    await m.answer(text, reply_markup=markup)
+
+
+@router.message(Command("help"))
+async def cmd_help(m: Message):
+    # /help — та же постраничная помощь, что и кнопка «❓ Помощь»
+    if not await ensure_access_msg(m):
+        return
+    text, markup = help_screen(0)
+    await m.answer(text, reply_markup=markup)
 
 
 @router.message(F.text == "📖 Книга заклинаний")
@@ -3220,6 +3393,15 @@ async def msg_catchall(m: Message):
     await m.answer(MENU_TEXT, reply_markup=KB_MENU)
 
 
+@router.callback_query(F.data.startswith("hlp:"))
+async def cb_help_page(call: CallbackQuery):
+    # Листание страниц помощи (◀️/▶️): hlp:{номер страницы}
+    n = call.data.split(":")[1]
+    text, markup = help_screen(int(n) if n.isdigit() else 0)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
 @router.callback_query(F.data == "mn:home")
 async def cb_home(call: CallbackQuery):
     await safe_answer(call)
@@ -3243,6 +3425,17 @@ async def safe_answer(call, text=None, show_alert=False, cache_time=None):
         raise
 
 
+def fit_text(text: str, limit: int = 4096) -> str:
+    # Обрезка сообщения до лимита Telegram (страховка от «message is too
+    # long»). Режем ПО ГРАНИЦЕ СТРОК: каждая строка экранов — законченный
+    # HTML-блок, поэтому разметка не ломается.
+    if len(text) <= limit:
+        return text
+    tail = "\n…(текст обрезан — уменьшите страницу/фильтр)"
+    cut = text[:max(0, limit - len(tail))].rsplit("\n", 1)[0]
+    return cut + tail
+
+
 async def safe_edit(call: CallbackQuery, text: str, markup=None):
     # edit_text падает, если сообщение не изменилось или его его нельзя
     # редактировать — не считаем это ошибкой.
@@ -3262,14 +3455,24 @@ async def safe_edit(call: CallbackQuery, text: str, markup=None):
                                              parse_mode=None)
             except TelegramBadRequest:
                 pass
+        elif "message is too long" in str(e).lower():
+            # Страховка от бага «Bad Request: message is too long»: режем
+            # текст по границе строк и повторяем (см. fit_text).
+            try:
+                await call.message.edit_text(fit_text(text), reply_markup=markup)
+            except TelegramBadRequest:
+                pass
         # Остальные ошибки (сообщение не изменилось и т.п.) — игнорируем.
 
 
 # =====================================================================
 # ХЕНДЛЕРЫ: коллекция и боевая колода
-# По заказу добавлен раздел «📚 Коллекция» — в нём видны ВСЕ карты
-# (с фильтрами по классу/колоде/расе и пагинацией), а «🃏 Колода»
-# показывает только боевой набор, который пойдёт в сражение.
+# «📚 Коллекция» — ВСЕ карты (фильтры по классу/колоде/расе, сортировка,
+# пагинация). «🃏 Колода» — просмотр колоды №1..3 + «🧩 Собрать колоду»:
+# отдельный экран сборки (вверху состав колоды, внизу доступные карты
+# со статами, фильтрами и сортировкой — по умолчанию от большего к
+# меньшему). in_deck — битовая маска: одна карта может лежать в
+# нескольких колодах сразу (см. deck_bit/card_decks и миграцию v2.3).
 # =====================================================================
 
 CARDS_PER_PAGE = 5
@@ -3321,7 +3524,9 @@ def col_filter_label(f: str) -> str:
 def card_text(row) -> str:
     sub_lbl = "🥷 Скрытность" if row["cls"] == CLS_WARRIOR else "🎯 Точность"
     mana_line = f"\n🔮 Запас манны: {row['mana_max']}" if row["cls"] == CLS_MAGE else ""
-    in_deck_line = (f"✅ В колоде №{row['in_deck']} — участвует в бою" if row["in_deck"]
+    ns = card_decks(row)
+    in_deck_line = (f"✅ В колод{'ах' if len(ns) > 1 else 'е'}: "
+                    f"{', '.join(f'№{n}' for n in ns)} — участвует в бою" if ns
                     else "➖ Вне колод — бой пропускает")
     rarity = row["rarity"] if "rarity" in row.keys() else "common"
     ttl = (row.get("title") or "").strip() if hasattr(row, "get") else ""
@@ -3350,9 +3555,10 @@ def card_text(row) -> str:
 
 def card_kb(row, ctx: str, page: str) -> InlineKeyboardMarkup:
     # Кнопки карточки; «Назад» возвращает туда, откуда пришли (ctx+page).
-    # Колода — через выбор одной из DECK_COUNT; титул — с L{TITLE_MIN_LEVEL}.
+    # Колоды — мультивыбор (карта может лежать в нескольких); титул — с L{TITLE_MIN_LEVEL}.
     cid = row["id"]
-    cur = f" (сейчас №{row['in_deck']})" if row["in_deck"] else ""
+    ns = card_decks(row)
+    cur = f" (сейчас {', '.join(f'№{n}' for n in ns)})" if ns else ""
     rows = [[ib(f"📥 В колоду…{cur}"[:64], f"dks:{cid}:{ctx}:{page}")],
             [ib("🗑 Сбросить карту", f"dkd:{cid}:{ctx}:{page}")]]
     pend = (row.get("pending_levels") or 0) if hasattr(row, "get") else 0
@@ -3393,9 +3599,9 @@ async def collection_screen(user_id: int, f: str, page: int):
     if not cards:
         return ("📚 <b>Коллекция пуста.</b>\n\nПолучите первую карту!",
                 kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
-    deck_counts = [sum(1 for c in cards if c["in_deck"] == n)
+    deck_counts = [sum(1 for c in cards if (c["in_deck"] or 0) & deck_bit(n))
                    for n in range(1, DECK_COUNT + 1)]
-    in_deck_n = sum(deck_counts)
+    in_deck_n = sum(1 for c in cards if c["in_deck"])   # хотя бы в одной колоде
     decks_line = " ".join(f"{n}️⃣{deck_counts[n - 1]}" for n in range(1, DECK_COUNT + 1))
     pend_n = sum(1 for c in cards if (c.get("pending_levels") or 0) > 0)
     filt = sort_cards(col_filter_cards(cards, flt), srt)
@@ -3412,7 +3618,7 @@ async def collection_screen(user_id: int, f: str, page: int):
              f"В бой идут первые {MAX_DECK} карт каждой колоды.", ""]
     rows = []
     for c in chunk:
-        mark = f"✅{c['in_deck']}" if c["in_deck"] else "➖"
+        mark = decks_mark(c)      # «✅1·3» — в колодах №1 и №3, «➖» — вне колод
         if (c.get("pending_levels") or 0) > 0:
             mark = "🌟" + mark      # карта ждёт распределения очков роста
         # В тексте сообщения — ВСЕ статы карты; на кнопке — компактно.
@@ -3434,11 +3640,10 @@ async def collection_screen(user_id: int, f: str, page: int):
 
 
 async def deck_screen(user_id: int, deck: int = 1, page: int = 0):
-    # «🃏 Колоды» — до DECK_COUNT колод. Открывается как коллекция:
-    # список ВСЕХ карт с пагинацией; тык на карту = положить/убрать
-    # из текущей колоды (если карта была в другой колоде — перенесётся).
-    # Состав текущей колоды выводится в тексте сообщения построчно.
-    # ⭐ Приоритетная колода идёт в бой без вопроса при старте.
+    # «🃏 Колоды» — ПРОСМОТР колоды №deck: состав с полными статами,
+    # вкладки 1..DECK_COUNT, ⭐приоритет и кнопка «🧩 Собрать колоду»
+    # (правка заказчика: сборка вынесена на отдельный экран —
+    # deck_builder_screen; коллекция отсюда больше не открывается).
     deck = max(1, min(int(deck), DECK_COUNT))
     cards = await db_user_cards(user_id)
     if not cards:
@@ -3454,10 +3659,13 @@ async def deck_screen(user_id: int, deck: int = 1, page: int = 0):
             lines.append(f"⚠️ Карт больше {MAX_DECK} — в бой пойдут только первые {MAX_DECK} (⚔️).")
         for i, c in enumerate(in_deck):
             mark = "⚔️" if i < MAX_DECK else "▪️"
-            lines.append(f"{mark} {card_full_line(c)}")
+            others = [n for n in card_decks(c) if n != deck]
+            also = (f" <i>(ещё в {'·'.join(f'№{n}' for n in others)})</i>" if others else "")
+            lines.append(f"{mark} {card_full_line(c)}{also}")
     else:
-        lines.append("Колода пуста — нажмите на карты в списке ниже, чтобы добавить их.")
-    lines += ["", f"<b>Все карты</b> (нажатие = в колоду №{deck} / из колоды):"]
+        lines.append("Колода пуста — нажмите «🧩 Собрать колоду» и выберите карты.")
+    lines += ["", f"В бой идут первые {MAX_DECK} карт колоды.",
+              "Одна и та же карта может лежать в нескольких колодах сразу."]
     rows = []
     tabs = []
     for n in range(1, DECK_COUNT + 1):
@@ -3465,26 +3673,77 @@ async def deck_screen(user_id: int, deck: int = 1, page: int = 0):
         star_n = "⭐" if pref == n else ""
         tabs.append(ib(f"{cur}{n}️⃣{star_n}·{len(decks[n])}", f"dk:{n}:0"))
     rows.append(tabs)
+    rows.append([ib("🧩 Собрать колоду", f"dkb:{deck}:{BUILDER_DEFAULT_SORT_F}:0")])
     rows.append([ib("⭐ Сделать приоритетной" if pref != deck else "⭐ Убрать приоритет",
                     f"pdk:{deck}")])
-    n_pages = max(1, (len(cards) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+    rows.append([ib("🏠 Меню", "mn:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def deck_builder_screen(user_id: int, deck: int, f: str, page: int):
+    # «🧩 Собрать колоду» — экран сборки колоды №deck (правка заказчика):
+    #  • ВВЕРХУ сообщения — карты, которые УЖЕ добавлены в эту колоду;
+    #  • ВНИЗУ — какие карты с какими статами сейчас выводятся: отфильтрованный
+    #    список ВСЕЙ коллекции (нажатие на кнопку = добавить/убрать из ЭТОЙ
+    #    колоды; другие колоды карты не затрагиваются — in_deck битовая маска);
+    #  • фильтрация как в коллекции, сортировка ПО УМОЛЧАНИЮ — от большего
+    #    к меньшему (BUILDER_DEFAULT_SORT = «pwr-», 💪 главная стата 🔽).
+    # f = «<фильтр>» или «<фильтр>~<код_сортировки>» (коды — SORTS).
+    deck = max(1, min(int(deck), DECK_COUNT))
+    flt, _, srt = f.partition("~")
+    srt = srt or BUILDER_DEFAULT_SORT
+    cards = await db_user_cards(user_id)
+    if not cards:
+        return ("🃏 <b>Карт пока нет.</b>\n\nПолучите первую карту — и добавьте её в колоду.",
+                kb([ib("🎲 Получить карту", "getc")], [ib("🏠 Меню", "mn:home")]))
+    bit = deck_bit(deck)
+    in_deck = [c for c in cards if (c["in_deck"] or 0) & bit]
+    lines = [f"🧩 <b>Сбор колоды №{deck}</b>: {len(in_deck)} карт", ""]
+    if len(in_deck) > MAX_DECK:
+        lines.append(f"⚠️ Больше {MAX_DECK} карт — в бой пойдут только первые {MAX_DECK} (⚔️).")
+    lines.append("<b>Уже в колоде:</b>")
+    if in_deck:
+        for i, c in enumerate(in_deck):
+            mark = "⚔️" if i < MAX_DECK else "▪️"
+            lines.append(f"{mark} {card_full_line(c)}")
+    else:
+        lines.append("(пусто — выберите карты внизу)")
+    filt = sort_cards(col_filter_cards(cards, flt), srt)
+    lines += ["",
+              f"<b>Доступные карты</b> · Фильтр: {col_filter_label(flt)} · "
+              f"Сортировка: {sort_label(srt)}",
+              f"(нажатие на карту = добавить в колоду №{deck} / убрать из неё):"]
+    if not filt:
+        lines.append(f"Под фильтром «{col_filter_label(flt)}» карт нет.")
+    n_pages = max(1, (len(filt) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
     page = max(0, min(int(page), n_pages - 1))
-    for c in cards[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]:
-        if c["in_deck"] == deck:
-            mark = "✅"
-        elif c["in_deck"]:
-            mark = f"🔸{c['in_deck']}"     # карта лежит в другой колоде
+    rows = []
+    for c in filt[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]:
+        m = c["in_deck"] or 0
+        if m & bit:
+            # в этой колоде (✅) + возможно ещё в чужих (🔸номера)
+            others = [n for n in card_decks(c) if n != deck]
+            mark = "✅" + (f"🔸{'·'.join(str(n) for n in others)}" if others else "")
+        elif m:
+            mark = f"🔸{'·'.join(str(n) for n in card_decks(c))}"   # только в других
         else:
             mark = "➖"
-        rows.append([ib(f"{mark} {card_line(c)}"[:64], f"dkg:{c['id']}:{deck}:{page}")])
+        # В тексте сообщения — ВСЕ статы карты; на кнопке — компактно.
+        lines.append(f"{mark} {card_full_line(c)}")
+        rows.append([ib(f"{mark} {card_line(c)}"[:64], f"dkg:{c['id']}:{deck}:{f}:{page}")])
     nav = []
     if page > 0:
-        nav.append(ib("◀️", f"dk:{deck}:{page - 1}"))
+        nav.append(ib("◀️", f"dkb:{deck}:{f}:{page - 1}"))
     if page < n_pages - 1:
-        nav.append(ib("▶️", f"dk:{deck}:{page + 1}"))
-    nav.append(ib("📚 Коллекция", "col:all:0"))
-    nav.append(ib("🏠 Меню", "mn:home"))
-    rows.append(nav)
+        nav.append(ib("▶️", f"dkb:{deck}:{f}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([ib(label, f"dkb:{deck}:{code}~{srt}:{page}") for code, label in COL_FILTERS[:3]])
+    rows.append([ib(label, f"dkb:{deck}:{code}~{srt}:{page}") for code, label in COL_FILTERS[3:]])
+    rows.append([ib("🎭 Раса", f"dkbr:{deck}:{f}:{page}"),
+                 ib("✨ Редк.", f"dkbq:{deck}:{f}:{page}"),
+                 ib("🔃 Сортировка", f"dkbs:{deck}:{f}:{page}")])
+    rows.append([ib(f"🃏 Колода №{deck}", f"dk:{deck}:0"), ib("🏠 Меню", "mn:home")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3587,31 +3846,125 @@ async def cb_pref_deck(call: CallbackQuery):
     await safe_edit(call, text, markup)
 
 
+@router.callback_query(F.data.startswith("dkb:"))
+async def cb_deck_builder(call: CallbackQuery):
+    # «🧩 Собрать колоду»: dkb:{номер}:{фильтр~сортировка}:{страница}
+    parts = call.data.split(":")
+    deck = int(parts[1]) if parts[1].isdigit() else 1
+    f = parts[2] if len(parts) > 2 else BUILDER_DEFAULT_SORT_F
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+    text, markup = await deck_builder_screen(call.from_user.id, deck, f, page)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("dkbr:"))
+async def cb_builder_races(call: CallbackQuery):
+    # Фильтр по расе внутри «🧩 Собрать колоду» (сортировка сохраняется)
+    _, deck, f, page = call.data.split(":")
+    _, _, srt = f.partition("~")
+    srt = srt or BUILDER_DEFAULT_SORT
+    rows = []
+    for i, race in enumerate(RACE_KEYS):
+        rows.append([ib(f"{RACES[race]['emoji']} {race}", f"dkb:{deck}:r{i}~{srt}:0")])
+    rows.append([ib("🧾 Все карты", f"dkb:{deck}:all~{srt}:0")])
+    rows.append([ib("⬅️ Назад к сборке", f"dkb:{deck}:{f}:{page}")])
+    await safe_answer(call)
+    await safe_edit(call, f"🎭 <b>Сбор колоды №{deck} — фильтр по расе:</b>",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("dkbq:"))
+async def cb_builder_rarities(call: CallbackQuery):
+    # Фильтр по редкости внутри «🧩 Собрать колоду»
+    _, deck, f, page = call.data.split(":")
+    _, _, srt = f.partition("~")
+    srt = srt or BUILDER_DEFAULT_SORT
+    rows = [[ib(rarity_label(k), f"dkb:{deck}:q{i}~{srt}:0")]
+            for i, k in enumerate(RARITY_KEYS)]
+    rows.append([ib("🧾 Все карты", f"dkb:{deck}:all~{srt}:0")])
+    rows.append([ib("⬅️ Назад к сборке", f"dkb:{deck}:{f}:{page}")])
+    await safe_answer(call)
+    await safe_edit(call, f"✨ <b>Сбор колоды №{deck} — фильтр по редкости:</b>",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("dkbs:"))
+async def cb_builder_sort_menu(call: CallbackQuery):
+    # Меню критериев сортировки режима сборки
+    _, deck, f, page = call.data.split(":")
+    _, _, srt = f.partition("~")
+    srt = srt or BUILDER_DEFAULT_SORT
+    cur = srt[:-1] if srt.endswith("-") else srt
+    rows = []
+    for code, label in SORTS:
+        mark = (" 🔽" if srt.endswith("-") else " 🔼") if code == cur else ""
+        rows.append([ib(f"{label}{mark}", f"dkbp:{code}:{deck}:{f}:{page}")])
+    rows.append([ib("⬅️ Назад к сборке", f"dkb:{deck}:{f}:{page}")])
+    await safe_answer(call)
+    await safe_edit(call, "🔃 <b>Сортировка при сборке колоды</b>\n\nПервое нажатие на "
+                          "критерий — по возрастанию (🔼), повторное нажатие на текущий — "
+                          "по убыванию (🔽).",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("dkbp:"))
+async def cb_builder_sort_pick(call: CallbackQuery):
+    # Выбран критерий сортировки сборки: тот же — меняет направление,
+    # новый — по возрастанию
+    _, code, deck, f, page = call.data.split(":")
+    flt, _, srt = f.partition("~")
+    srt = srt or BUILDER_DEFAULT_SORT
+    if srt == code:
+        new = code + "-"          # возрастание → убывание
+    elif srt == code + "-":
+        new = code                # убывание → снова возрастание
+    else:
+        new = code
+    text, markup = await deck_builder_screen(call.from_user.id, int(deck),
+                                             f"{flt}~{new}",
+                                             int(page) if page.isdigit() else 0)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
 @router.callback_query(F.data.startswith("dkg:"))
 async def cb_deck_grid_toggle(call: CallbackQuery):
-    # Тык на карту в списке колод: положить в текущую / убрать
-    # (если была в другой колоде — переносится в текущую).
-    _, cid_s, deck_s, page_s = call.data.split(":")
-    cid, deck, page = int(cid_s), int(deck_s), int(page_s)
+    # Тык на карту в «🧩 Собрать колоду»: добавить в колоду №deck / убрать
+    # из НЕЁ. in_deck — битовая маска: остальные колоды карты не меняются
+    # (одна карта может лежать в нескольких колодах одновременно).
+    # Новый формат dkg:{cid}:{deck}:{фильтр~сорт}:{страница}; старый
+    # dkg:{cid}:{deck}:{страница} (кнопки прежних сообщений) — после
+    # переключения возвращаем на просмотр колоды.
+    parts = call.data.split(":")
+    cid, deck = int(parts[1]), int(parts[2])
+    legacy = len(parts) <= 4
+    f = BUILDER_DEFAULT_SORT_F if legacy else parts[3]
+    page = int(parts[-1]) if parts[-1].isdigit() else 0
     row = await db_get_card(cid, call.from_user.id)
     if not row:
         await safe_answer(call, "Карта не найдена.", show_alert=True)
         return
-    if row["in_deck"] == deck:
-        await db_set_in_deck(cid, 0)
+    bit = deck_bit(deck)
+    mask = row["in_deck"] or 0
+    if mask & bit:
+        new_mask = mask & ~bit
         msg = f"Убрано из колоды №{deck}"
     else:
         if DECK_LIMIT_ENABLED:
             cards = await db_user_cards(call.from_user.id)
-            if sum(1 for c in cards if c["in_deck"] == deck) >= MAX_DECK:
+            if sum(1 for c in cards if (c["in_deck"] or 0) & bit) >= MAX_DECK:
                 await safe_answer(call, f"В колоде №{deck} уже {MAX_DECK} карт!",
                                   show_alert=True)
                 return
-        await db_set_in_deck(cid, deck)
-        msg = (f"Добавлено в колоду №{deck}" if not row["in_deck"]
-               else f"Перенесено из колоды №{row['in_deck']} в №{deck}")
+        new_mask = mask | bit
+        msg = f"Добавлено в колоду №{deck}"
+    await db_set_in_deck(cid, new_mask)
     await safe_answer(call, msg)
-    text, markup = await deck_screen(call.from_user.id, deck, page)
+    if legacy:
+        text, markup = await deck_screen(call.from_user.id, deck, page)
+    else:
+        text, markup = await deck_builder_screen(call.from_user.id, deck, f, page)
     await safe_edit(call, text, markup)
 
 
@@ -3637,34 +3990,49 @@ async def cb_deck_picker(call: CallbackQuery):
         await safe_edit(call, "Карта не найдена.", kb([ib("⬅️ Назад", back_cb(ctx, page))]))
         return
     rows = []
+    ns = card_decks(row)
     for n in range(1, DECK_COUNT + 1):
-        mark = " ✅" if row["in_deck"] == n else ""
+        mark = " ✅" if n in ns else " ➕"
         rows.append([ib(f"🃏 Колода №{n}{mark}", f"dka:{cid}:{n}:{ctx}:{page}")])
-    if row["in_deck"]:
-        rows.append([ib("📤 Убрать из колоды", f"dka:{cid}:0:{ctx}:{page}")])
+    if ns:
+        rows.append([ib("📤 Убрать из всех колод", f"dka:{cid}:0:{ctx}:{page}")])
     rows.append([ib("⬅️ Назад", f"card:{cid}:{ctx}:{page}")])
-    await safe_edit(call, f"📥 В какую колоду положить «{disp_name(row)}»?",
+    await safe_edit(call, f"📥 В какие колоды положить «{disp_name(row)}»?\n"
+                          "Карта может лежать в нескольких колодах сразу: "
+                          "нажатие ➕ добавляет, ✅ — убирает из этой колоды.",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.callback_query(F.data.startswith("dka:"))
 async def cb_deck_apply(call: CallbackQuery):
-    # Положить карту в колоду №n (0 = убрать из колод)
+    # Мультивыбор колод: тумблер бита колоды №n в маске in_deck
+    # (n = 0 — убрать карту из ВСЕХ колод). Другие колоды не меняются.
     _, cid, n, ctx, page = call.data.split(":")
     cid_i, n_i = int(cid), int(n)
     row = await db_get_card(cid_i, call.from_user.id)
     if not row:
         await safe_answer(call, "Карта не найдена.", show_alert=True)
         return
-    if n_i > 0 and DECK_LIMIT_ENABLED and row["in_deck"] != n_i:
-        cards = await db_user_cards(call.from_user.id)
-        if sum(1 for c in cards if c["in_deck"] == n_i) >= MAX_DECK:
-            await safe_answer(call, f"В колоде №{n_i} не может быть больше {MAX_DECK} карт!",
-                              show_alert=True)
-            return
-    await db_set_in_deck(cid_i, n_i)
+    mask = row["in_deck"] or 0
+    if n_i == 0:
+        new_mask, msg = 0, "Убрано из всех колод"
+    else:
+        bit = deck_bit(n_i)
+        if mask & bit:
+            new_mask = mask & ~bit
+            msg = f"Убрано из колоды №{n_i}"
+        else:
+            if DECK_LIMIT_ENABLED:
+                cards = await db_user_cards(call.from_user.id)
+                if sum(1 for c in cards if (c["in_deck"] or 0) & bit) >= MAX_DECK:
+                    await safe_answer(call, f"В колоде №{n_i} не может быть больше "
+                                            f"{MAX_DECK} карт!", show_alert=True)
+                    return
+            new_mask = mask | bit
+            msg = f"Добавлено в колоду №{n_i}"
+    await db_set_in_deck(cid_i, new_mask)
     row = await db_get_card(cid_i, call.from_user.id)
-    await safe_answer(call, "Убрано из колоды" if n_i == 0 else f"В колоде №{n_i}")
+    await safe_answer(call, msg)
     await safe_edit(call, card_text(row), card_kb(row, ctx, page))
 
 
@@ -3802,16 +4170,17 @@ async def cb_toggle_deck(call: CallbackQuery):
     if not row:
         await safe_answer(call, "Карта не найдена.", show_alert=True)
         return
-    if row["in_deck"]:
-        await db_set_in_deck(row["id"], 0)
-        await safe_answer(call, "Убрано из колоды")
+    mask = row["in_deck"] or 0
+    if mask & deck_bit(1):
+        await db_set_in_deck(row["id"], mask & ~deck_bit(1))
+        await safe_answer(call, "Убрано из колоды №1")
     else:
         if DECK_LIMIT_ENABLED:
             cards = await db_user_cards(call.from_user.id)
-            if sum(1 for c in cards if c["in_deck"] == 1) >= MAX_DECK:
+            if sum(1 for c in cards if (c["in_deck"] or 0) & deck_bit(1)) >= MAX_DECK:
                 await safe_answer(call, f"В колоде не может быть больше {MAX_DECK} карт!", show_alert=True)
                 return
-        await db_set_in_deck(row["id"], 1)
+        await db_set_in_deck(row["id"], mask | deck_bit(1))
         await safe_answer(call, "Добавлено в колоду №1")
     row = await db_get_card(int(cid), call.from_user.id)
     await safe_edit(call, card_text(row), card_kb(row, ctx, page))
@@ -3930,8 +4299,8 @@ async def battle_setup_screen(user_id: int, deck: int = 0, force_pick: bool = Fa
     decks = decks_of(all_cards)
     non_empty = [n for n in sorted(decks) if decks[n]]
     if not non_empty:
-        return ("⚔️ <b>Все колоды пусты!</b>\n\nОткройте «🃏 Колода» и нажмите на карты, "
-                "которые возьмёте в бой.",
+        return ("⚔️ <b>Все колоды пусты!</b>\n\nОткройте «🃏 Колода» → «🧩 Собрать колоду» "
+                "и выберите карты, которые возьмёте в бой.",
                 kb([ib("🃏 Колоды", "dk:1:0")], [ib("🏠 Меню", "mn:home")]))
     if deck <= 0 and not force_pick:
         pref = await user_flag(user_id, "pref_deck")
@@ -5175,7 +5544,7 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
             r = None if parts[2] == "rand" else parts[2]
             d = generate_card_data(rarity=r)
             cid = await db_add_card(uid, d)
-            await db_set_in_deck(cid, 1)  # админская карта сразу в колоде №1
+            await db_set_in_deck(cid, deck_bit(1))  # админская карта сразу в колоде №1
             row = await db_get_card(cid, uid)
             await safe_answer(call, "Карта выдана ✅")
             await safe_edit(call, "🎲 <b>Карта выдана</b> (сразу добавлена в колоду №1 "
