@@ -3567,7 +3567,7 @@ ARTIFACTS_HELP_TEXT = """🗡 <b>Артефакты и миссии (экспе�
 • Артефакты качаются ОТДЕЛЬНО от карт за 💎 осколки: каждый уровень усиливает бонус (потолок — L10). Чем выше редкость артефакта, тем выше базовый бонус.
 
 💎 <b>Осколки и миссии</b>
-• Осколки добываются в МИССИЯХ: «👤 Профиль» → «🗡 Артефакты» → «⛏ Миссия по добыче». Отряд (ваша боевая колода) уходит на вылазку — это обычный бой с ботом повышенной сложности.
+• Осколки добываются в МИССИЯХ: «👤 Профиль» → «🗡 Артефакты» → «⛏ Миссия по добыче». Отряд (ваша боевая колода) уходит на вылазку — это обычный бой с ботом повышенной сложности; расстановку (сколько клеток фронта и тыла: 3+1, 2+2 или 1+3) вы выбираете сами, как перед обычным боем.
 • 🟢 Лёгкая (враг 🟦 редкий): +8💎 за победу · 🟡 Обычная (🟪 эпический, +1 уровень): +15💎 · 🔴 Тяжёлая (🟨 легендарный, +2 уровня): +30💎. Поражение/ничья — без награды.
 • Между миссиями действует кулдаун MISSION_COOLDOWN_MIN (в минутах).
 
@@ -6568,42 +6568,86 @@ async def cb_missions(call: CallbackQuery):
     await safe_edit(call, text, markup)
 
 
-@router.callback_query(F.data.startswith("artmr:"))
-async def cb_mission_run(call: CallbackQuery):
-    # Старт миссии: обычный бой, но с меткой state["mission"] — по победе
-    # end_battle начислит осколки. Колода — ⭐приоритетная, иначе первая
-    # непустая (как в админ-прогоне).
-    if not await _art_ok(call):
-        return
-    key = call.data.split(":")[1]
-    m = next((x for x in MISSIONS if x["key"] == key), None)
-    uid = call.from_user.id
-    if m is None:
-        await safe_answer(call, "Неизвестная миссия.", show_alert=True)
-        return
+def _mission_by_key(key: str):
+    return next((x for x in MISSIONS if x["key"] == key), None)
+
+
+async def _mission_preflight(uid: int):
+    # Общие проверки перед миссией (выбор раскладки и старт): активный бой,
+    # кулдаун, наличие колоды. Возвращает (текст_ошибки, None) или (None, карты).
+    # Колода — ⭐приоритетная, иначе первая непустая (как в админ-прогоне).
     if await db_load_battle(uid):
-        await safe_answer(call, "У вас уже идёт бой — сначала завершите его.",
-                          show_alert=True)
-        return
+        return "У вас уже идёт бой — сначала завершите его.", None
     if MISSION_COOLDOWN_MIN > 0:
         left = cooldown_left(await db_get_stamp(uid, "last_mission_at"),
                              MISSION_COOLDOWN_MIN)
         if left > 0:
-            await safe_answer(call, f"⏳ Миссия доступна через {fmt_left(left)}.",
-                              show_alert=True)
-            return
+            return f"⏳ Миссия доступна через {fmt_left(left)}.", None
     all_cards = await db_user_cards(uid)
     decks = decks_of(all_cards)
     pref = await user_flag(uid, "pref_deck")
     deck = pref if decks.get(pref) else next((d for d in sorted(decks) if decks[d]), 0)
     cards = decks.get(deck, [])[:MAX_DECK] if deck else []
     if not cards:
-        await safe_answer(call, "Все колоды пусты — соберите колоду (🃏 Колода).",
-                          show_alert=True)
+        return "Все колоды пусты — соберите колоду (🃏 Колода).", None
+    return None, cards
+
+
+@router.callback_query(F.data.startswith("artmr:"))
+async def cb_mission_pick(call: CallbackQuery):
+    # Выбрана миссия → выбор РАССТАНОВКИ (сколько клеток фронта и тыла —
+    # те же 3 раскладки, что и в обычном бою: 3+1, 2+2, 1+3).
+    if not await _art_ok(call):
+        return
+    key = call.data.split(":")[1]
+    m = _mission_by_key(key)
+    uid = call.from_user.id
+    if m is None:
+        await safe_answer(call, "Неизвестная миссия.", show_alert=True)
+        return
+    err, cards = await _mission_preflight(uid)
+    if err:
+        await safe_answer(call, err, show_alert=True)
+        return
+    await safe_answer(call)
+    await safe_edit(call, f"⛏ <b>Миссия: {m['label']}</b>\n\n"
+                          f"Отряд: {len(cards)} карт · противник: {rarity_label(m['rar'])}"
+                          + (f", уровень +{m['dlvl']}" if m["dlvl"] else "")
+                          + f" · награда за победу: 💎{m['shards']}\n\n"
+                          "Выберите расстановку (<b>всего 4 клетки</b>, максимум 3 "
+                          "на линию, обе линии обязательны — как в обычном бою):\n"
+                          "• <b>3 фронта / 1 тыл</b> — фронт 1,2,3; тыл 2\n"
+                          "• <b>2 фронта / 2 тыла</b> — обе линии: 1 и 3\n"
+                          "• <b>1 фронт / 3 тыла</b> — фронт 2; тыл 1,2,3",
+                    kb([ib("🛡 3 фронта / 1 тыл", f"artmgo:{key}:31")],
+                       [ib("⚖️ 2 фронта / 2 тыла", f"artmgo:{key}:22")],
+                       [ib("🏹 1 фронт / 3 тыла", f"artmgo:{key}:13")],
+                       [ib("⬅️ Назад", "artm")]))
+
+
+@router.callback_query(F.data.startswith("artmgo:"))
+async def cb_mission_run(call: CallbackQuery):
+    # Старт миссии с выбранной раскладкой: artmgo:{key}:{layout}. Обычный
+    # бой движка с меткой state["mission"] — по победе end_battle начислит
+    # осколки. Проверки (бой/кулдаун/колода) повторяются — кнопка могла
+    # «дожить» с экрана, показанного до их срабатывания.
+    if not await _art_ok(call):
+        return
+    parts = call.data.split(":")
+    key = parts[1]
+    layout_key = parts[2] if len(parts) > 2 else ""
+    m = _mission_by_key(key)
+    uid = call.from_user.id
+    if m is None or layout_key not in LAYOUTS:
+        await safe_answer(call, "Неизвестная миссия или раскладка.", show_alert=True)
+        return
+    err, cards = await _mission_preflight(uid)
+    if err:
+        await safe_answer(call, err, show_alert=True)
         return
     artifacts = await equipped_artifact_bonuses(uid)
     avg_level = max(1, round(sum(c["level"] for c in cards) / len(cards)))
-    state = create_battle(cards, random.choice(list(LAYOUTS)),
+    state = create_battle(cards, layout_key,
                           enemy_rarity=m["rar"], enemy_level=avg_level + m["dlvl"],
                           artifacts=artifacts)
     state["mission"] = {"key": m["key"], "label": m["label"], "shards": m["shards"]}
