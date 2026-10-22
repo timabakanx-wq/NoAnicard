@@ -674,4 +674,4 @@ async def _notify_user_error_wrap(chat_id: int, text: str) -> str:
         return await _notify_user_error(bot, chat_id, text)
     finally:
         await bot.session.close()
-м
+
