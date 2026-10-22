@@ -21,6 +21,7 @@ import os
 import random
 import re
 import tempfile
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -58,6 +59,21 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "РиЧорт")
 
 # Максимум боёв в админском прогоне (строго меньше 50)
 SIM_MAX_BATTLES = 49
+
+# =====================================================================
+# ТАЙМАУТЫ (кулдауны) — в МИНУТАХ. 0 = ограничение ВЫКЛЮЧЕНО.
+# Перед началом боя / получением карты бот сначала проверяет, сколько
+# времени прошло с прошлого такого действия (users.last_battle_at /
+# users.last_card_at). Меньше таймаута — отказ с сообщением «доступно
+# через …». Отсчёт боя ведётся от момента ПОСЛЕДНЕГО события: старт
+# боя ИЛИ его завершение (что позже). Админ-прогон боёв и выдача карт
+# через админ-панель таймаутами НЕ ограничиваются.
+# Значения можно переопределить переменными окружения Vercel.
+# =====================================================================
+BATTLE_TIMEOUT_MIN = int(os.environ.get("BATTLE_TIMEOUT_MIN", "0") or 0)
+CARD_TIMEOUT_MIN = int(os.environ.get("CARD_TIMEOUT_MIN", "0") or 0)
+# Кулдаун миссий по добыче ресурсов (часть фичи «Артефакты», см. ниже).
+MISSION_COOLDOWN_MIN = int(os.environ.get("MISSION_COOLDOWN_MIN", "30") or 0)
 
 # DB_PATH не используется: БД — Supabase (SUPABASE_URL/SUPABASE_KEY)
 
@@ -131,6 +147,12 @@ RARITY_INFO = {
     "rare":      {"label": "🟦 Редкая",     "mult": 110, "weight": 15, "rank": 2},
     "epic":      {"label": "🟪 Эпическая",  "mult": 115, "weight": 6,  "rank": 3},
     "legendary": {"label": "🟨 Легендарная", "mult": 120, "weight": 2,  "rank": 4},
+    # 🟧 ГЕРОИЧЕСКАЯ — редкость собственного персонажа игрока («🦸 Мой герой»).
+    # weight=0: из «🎲 Получить карту» она НЕ выпадает никогда — герой
+    # создаётся один раз через отдельный поток (класс + главная стата),
+    # генерация = перебор ЭПИЧЕСКИХ карт (mult 115), пока выбранная стата
+    # не победит в своей паре. Либо выдаётся админом вручную.
+    "heroic":    {"label": "🟧 Героическая", "mult": 115, "weight": 0,  "rank": 5},
 }
 RARITY_KEYS = list(RARITY_INFO.keys())
 
@@ -142,6 +164,104 @@ PITY_CONFIG = {
     "epic": -1,
     "legendary": -1,
 }
+
+# =====================================================================
+# 🦸 СОБСТВЕННЫЙ ПЕРСОНАЖ («Мой герой») — редкость «🟧 Героическая»
+# =====================================================================
+# Игрок ОДИН РАЗ создаёт личного героя:
+#   1) выбирает КЛАСС (воин / заклинатель);
+#   2) выбирает ГЛАВНУЮ СТАТУ — ровно одну из пар системы весов:
+#        пара «Атака ↔ Защита»:  защита при сравнении ДЕЛИТСЯ НА 2 (//2);
+#        пара «Здоровье ↔ Скрытность/Точность»: скрытность УМНОЖАЕТСЯ НА 4;
+#      т.е. атака побеждает, если attack >= armor//2; здоровье побеждает,
+#      если hp_max >= sub*4 (и наоборот — для защитных/скрытных билдов);
+#   3) карта генерируется ПЕРЕБОРОМ персонажей ЭПИЧЕСКОЙ редкости, пока
+#      выбранная стата не окажется большей в своей паре, и получает
+#      редкость «heroic» (статы остаются эпическими — как заказано);
+#   4) имя герою игрок может поменять СРАЗУ (бот спрашивает после
+#      создания) и в любой момент потом (кнопка «✏️ Переименовать»).
+# У заклинателя защита в паре с атакой не участвует (КЗ без перекоса и
+# всегда проигрывает атаке) — поэтому магу защита не предлагается;
+# его пары: Атака↔Запас Манны и Здоровье↔Точность.
+HERO_MAIN_STATS = {
+    CLS_WARRIOR: [("attack", "⚔️ Атака"), ("armor", "🛡 Защита"),
+                  ("hp", "❤️ Здоровье"), ("sub", "🥷 Скрытность")],
+    CLS_MAGE:    [("attack", "⚔️ Атака"), ("hp", "❤️ Здоровье"),
+                  ("sub", "🎯 Точность")],
+}
+HERO_STAT_LABEL = {"attack": "⚔️ Атака", "armor": "🛡 Защита",
+                   "hp": "❤️ Здоровье", "sub": "🥷 Скрытность / 🎯 Точность"}
+HERO_REROLL_LIMIT = 500   # потолок перебора эпических персонажей (страховка)
+
+# =====================================================================
+# 🌀 АРКАНОВЫЕ ПЕРСОНАЖИ (экспериментальная фича — включается только
+# в админ-панели, индивидуально каждому игроку: users.feat_arcana)
+# =====================================================================
+# Аркановая карта принадлежит одному из сетов. Когда на ПОЛЕ БОЯ
+# одновременно стоит нужное число (need) карт одного сета — каждая из
+# них получает постоянную ауру-бафф (снятие ауры — когда сет распался,
+# например союзник погиб). Шанс того, что НОВАЯ полученная карта
+# окажется аркановой (только при включённой фиче) — ARCANA_CHANCE_PCT.
+ARCANA_SETS = {
+    "flame": {"name": "Пламя",    "emoji": "🔥", "need": 2, "fx": "arc_atk",
+              "val": 2, "desc": "2+ карт сета на поле: +2 к Атаке каждой."},
+    "stone": {"name": "Камень",   "emoji": "🪨", "need": 2, "fx": "arc_def",
+              "val": 2, "desc": "2+ карт сета на поле: +2 к Защите (КЗ) каждой."},
+    "life":  {"name": "Жизнь",    "emoji": "🌿", "need": 2, "fx": "arc_life",
+              "val": 2, "desc": "2+ карт сета на поле: каждая лечит 2 HP в начале своего хода."},
+}
+ARCANA_KEYS = list(ARCANA_SETS.keys())
+ARCANA_CHANCE_PCT = int(os.environ.get("ARCANA_CHANCE_PCT", "2") or 0)  # «пизда редкие»
+
+# =====================================================================
+# 🗡 АРТЕФАКТЫ (экспериментальная фича — включается только в админ-
+# панели, индивидуально: users.feat_artifacts). Ресурс — 💎 осколки
+# (users.shards), добываются в МИССИЯХ: отряд (боевая колода) уходит
+# на вылазку, проводится бой с ботом, за ПОБЕДУ начисляются осколки.
+# Артефакт надевается на карту (1 артефакт на карту, 1 карта у артефакта)
+# и добавляет статы в бою; качается ОТДЕЛЬНО от карты за осколки.
+# Бонус = ART_BASE[стата] + ранг редкости + (уровень−1)×ART_PER_LVL[стата].
+# ВАЖНО: бонусы действуют только в бою и НЕ въедаются в БД карты —
+# при записи итогов боя они вычитаются обратно (см. art_bonus).
+# =====================================================================
+ART_SLOTS = {"attack": "⚔️ Оружие", "armor": "🛡 Доспех",
+             "hp": "❤️ Амулет жизни", "sub": "🥷 Клык тени"}
+ART_BASE = {"attack": 2, "armor": 2, "hp": 5, "sub": 1}     # бонус 1-го уровня
+ART_PER_LVL = {"attack": 1, "armor": 1, "hp": 2, "sub": 1}  # рост за уровень
+ART_MAX_LEVEL = 10
+ART_CRAFT_COST = 30          # 💎 за создание артефакта (стата — на выбор)
+ART_UP_COST_STEP = 10        # 💎 улучшение: ART_UP_COST_STEP × текущий уровень
+ART_NAMES = {
+    "attack": ["Клинок Зари", "Секира Ярости", "Рунический Меч", "Пламенное Копьё",
+               "Стальной Клык", "Гром Небесный", "Жнец Битв"],
+    "armor":  ["Щит Стража", "Адамантовая Лата", "Руническая Броня", "Чешуя Дракона",
+               "Покров Клятвы", "Бастион Веры", "Каменная Кожа"],
+    "hp":     ["Рубиновое Сердце", "Амулет Жизни", "Чаша Жизни", "Слеза Феникса",
+               "Кровь-Камень", "Сердце Матриарха", "Источник Сил"],
+    "sub":    ["Плащ Теней", "Кинжал Убийцы", "Сапоги Тихого Шага", "Вуаль Сумрака",
+               "Отравленный Шип", "Шёпот Ночи", "Маска Без Лица"],
+}
+# Миссии по добыче осколков: противник фиксированной редкости, его уровень =
+# средний уровень вашей колоды + dlvl. Награда — только за ПОБЕДУ.
+MISSIONS = [
+    {"key": "e", "label": "🟢 Лёгкая вылазка",  "rar": "rare",      "dlvl": 0, "shards": 8},
+    {"key": "n", "label": "🟡 Обычная вылазка", "rar": "epic",      "dlvl": 1, "shards": 15},
+    {"key": "h", "label": "🔴 Тяжёлая вылазка", "rar": "legendary", "dlvl": 2, "shards": 30},
+]
+
+
+def art_up_cost(level: int) -> int:
+    # Стоимость улучшения артефакта с уровня level до level+1 (в осколках)
+    return ART_UP_COST_STEP * max(1, int(level))
+
+
+def art_bonus_of(row) -> int:
+    # Текущий бонус артефакта к его стате
+    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
+    rank = rarity_rank(row.get("rarity") or "common")
+    lvl = max(1, int(row.get("level") or 1))
+    return ART_BASE[stat] + rank + (lvl - 1) * ART_PER_LVL[stat]
+
 
 # =====================================================================
 # ФОРМУЛЫ БОЯ — все коэффициенты собраны ЗДЕСЬ (правка заказчика).
@@ -270,6 +390,13 @@ def sanitize_nick(text: str) -> str:
     return re.sub(r"[<>&]", "", text or "").strip()[:24]
 
 
+def sanitize_hero_name(text: str) -> str:
+    # Имя собственного героя (🦸) — игрок вводит сразу при создании или
+    # потом кнопкой «✏️ Переименовать». Правила как у титула: без «<>&»,
+    # длина до 32. Заменяет связку «имя + фамилия» целиком.
+    return re.sub(r"[<>&]", "", text or "").strip()[:32]
+
+
 def disp_name(x, surname: bool = True) -> str:
     # Имя для показа: если карте дарован титул и включён режим
     # «использовать как имя» — титул идёт ПЕРВЫМ, затем настоящие
@@ -291,6 +418,14 @@ def main_stat(cls: str, attack: int, armor: int):
     return ("⚔", attack) if attack >= armor // 2 else ("🛡", armor)
 
 
+def arcana_mark(c) -> str:
+    # 🌀 Значок сета аркановой карты (пусто для обычных). Работает и со
+    # строками БД, и с боевыми юнитами.
+    key = (c.get("arcana") or "") if hasattr(c, "get") else ""
+    arc = ARCANA_SETS.get(key)
+    return arc["emoji"] if arc else ""
+
+
 def card_line(c) -> str:
     # Карта в одну строку (коллекция/колоды). Порядок по заказу:
     # класс, редкость, уровень, имя, атака или защита (что больше;
@@ -301,7 +436,8 @@ def card_line(c) -> str:
         res = f"🔮{c['mana_max']}"
     else:
         res = f"❤{c['hp']}" if c["hp"] >= c["hp_max"] else f"❤{c['hp']}/{c['hp_max']}"
-    return f"{CLS_EMOJI[c['cls']]}{rem} L{c['level']} {disp_name(c)} {ico}{val} {res}"
+    return (f"{CLS_EMOJI[c['cls']]}{arcana_mark(c)}{rem} L{c['level']} "
+            f"{disp_name(c)} {ico}{val} {res}")
 
 
 def card_full_line(c) -> str:
@@ -310,7 +446,7 @@ def card_full_line(c) -> str:
     rem = rarity_label(c.get("rarity") or "common").split(" ")[0]
     sub_e = "🥷" if c["cls"] == CLS_WARRIOR else "🎯"
     mana = f" · 🔮{c['mana_max']}" if c["cls"] == CLS_MAGE else ""
-    return (f"{CLS_EMOJI[c['cls']]}{rem} L{c['level']} {disp_name(c)} · "
+    return (f"{CLS_EMOJI[c['cls']]}{arcana_mark(c)}{rem} L{c['level']} {disp_name(c)} · "
             f"⚔{c['attack']} · 🛡{c['armor']} · ❤{c['hp']}/{c['hp_max']} · "
             f"{sub_e}{c['sub']} · ⚡{c['end_max']}{mana}")
 
@@ -613,6 +749,16 @@ async def ensure_user(user_id: int, username):
                 prefer="resolution=merge-duplicates")
 
 
+async def ensure_user_row(user_id: int):
+    # Гарантировать наличие строки users, НЕ трогая существующую (upsert
+    # с username=None затёр бы имя). Нужно админ-панели: фичи включаются
+    # игроку, который боту мог ещё ни разу не написать.
+    rows = await _rest("GET", "users",
+                       params={"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"})
+    if not rows:
+        await ensure_user(user_id, None)
+
+
 async def has_access(user_id: int) -> bool:
     rows = await _rest("GET", "users",
                        params={"user_id": f"eq.{user_id}", "select": "access", "limit": "1"})
@@ -670,15 +816,26 @@ async def db_add_result(user_id: int, result: str):
 # ---------- карты ----------
 
 async def db_add_card(user_id: int, d: dict) -> int:
-    # Новая карта попадает в КОЛЛЕКЦИЮ, но не в колоду (in_deck=0)
+    # Новая карта попадает в КОЛЛЕКЦИЮ, но не в колоду (in_deck=0).
+    # hero_main — выбранная главная стата героя (🟧 heroic), arcana — сет
+    # арканового персонажа («» = обычный). Колонки — см. migration_v3.sql.
     rows = await _rest("POST", "cards", json_body={
         "user_id": user_id, "name": d["name"], "surname": d["surname"],
         "race": d["race"], "cls": d["cls"], "rarity": d.get("rarity", "common"),
         "level": d["level"], "exp": d["exp"], "attack": d["attack"], "armor": d["armor"],
         "hp": d["hp_max"], "hp_max": d["hp_max"], "sub": d["sub"],
         "mana_max": d["mana_max"], "end_max": d["end_max"], "in_deck": 0,
+        "hero_main": d.get("hero_main", ""), "arcana": d.get("arcana", ""),
     }, prefer="return=representation")
     return rows[0]["id"] if rows else 0
+
+
+async def db_rename_card(card_id: int, name: str, user_id: int):
+    # Переименование ГЕРОЯ (🟧 heroic): новое имя заменяет связку
+    # «имя + фамилия» целиком (surname очищается) — как ввёл игрок.
+    await _rest("PATCH", "cards",
+                params={"id": f"eq.{card_id}", "user_id": f"eq.{user_id}"},
+                json_body={"name": name, "surname": ""})
 
 
 async def db_get_card(card_id: int, user_id: int):
@@ -769,9 +926,19 @@ async def db_apply_growth(card_id: int, d: dict):
 async def db_sync_card_after_battle(u: dict, hp: int):
     # pending_levels — отложенные очки роста: прокачка теперь ТОЛЬКО после
     # матча, они уезжают в карту и ждут в коллекции («🌟 Ожидают повышения»).
+    # 🗡 АРТЕФАКТЫ: боевые статы юнита включают бонусы надетых артефактов
+    # (u["art_bonus"]). В БД карты они попасть НЕ должны — вычитаем их
+    # обратно при записи (карта «без доспехов» — как до боя).
+    ab = u.get("art_bonus") or {}
+    hp_true = max(0, hp - ab.get("hp", 0))
+    if hp > 0:
+        hp_true = max(1, hp_true)     # выживший не может остаться на 0 HP
     await _rest("PATCH", "cards", params={"id": f"eq.{u['card_id']}"}, json_body={
-        "level": u["level"], "exp": u["xp"], "attack": u["attack"], "armor": u["armor_base"],
-        "hp": hp, "hp_max": u["hp_max"], "sub": u["sub"],
+        "level": u["level"], "exp": u["xp"],
+        "attack": u["attack"] - ab.get("attack", 0),
+        "armor": u["armor_base"] - ab.get("armor", 0),
+        "hp": hp_true, "hp_max": u["hp_max"] - ab.get("hp", 0),
+        "sub": u["sub"] - ab.get("sub", 0),
         "mana_max": u["mana_max"], "end_max": u["end_max"],
         "pending_levels": u.get("pending_levels", 0)})
 
@@ -808,6 +975,130 @@ async def db_save_sim(user_id: int, n: int, summary: str, log: str) -> int:
         "user_id": user_id, "n": n, "summary": summary, "log": log},
         prefer="return=representation")
     return rows[0]["id"] if rows else 0
+
+
+# ---------- таймауты: метки времени (timestamptz) ----------
+
+def _now_iso() -> str:
+    # Текущий момент UTC в ISO-формате — так PostgREST пишет timestamptz
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(s):
+    # Разбор timestamptz из Supabase («…+00:00» или «…Z») → datetime UTC
+    if not s:
+        return None
+    try:
+        if isinstance(s, str):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+async def db_stamp(user_id: int, col: str):
+    # Поставить метку «сейчас» (last_battle_at / last_card_at / last_mission_at)
+    await _rest("PATCH", "users", params={"user_id": f"eq.{user_id}"},
+                json_body={col: _now_iso()})
+
+
+async def db_get_stamp(user_id: int, col: str):
+    rows = await _rest("GET", "users",
+                       params={"user_id": f"eq.{user_id}", "select": col, "limit": "1"})
+    return rows[0].get(col) if rows else None
+
+
+def cooldown_left(last_ts, timeout_min: int) -> int:
+    # Сколько СЕКУНД осталось ждать (0 — можно). last_ts — строка из БД.
+    if timeout_min <= 0:
+        return 0
+    dt = _parse_ts(last_ts)
+    if dt is None:
+        return 0
+    left = (dt - datetime.now(timezone.utc)).total_seconds() + timeout_min * 60
+    return max(0, int(left))
+
+
+def fmt_left(sec: int) -> str:
+    # «1 ч 05 мин» / «12 мин 30 с» / «45 с»
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} ч {m:02d} мин"
+    if m:
+        return f"{m} мин {s:02d} с"
+    return f"{s} с"
+
+
+# ---------- экспериментальные фичи и осколки (users) ----------
+
+async def db_get_flags(user_id: int) -> dict:
+    # Флаги фич одним запросом: feat_artifacts / feat_arcana + баланс 💎
+    rows = await _rest("GET", "users", params={
+        "user_id": f"eq.{user_id}",
+        "select": "feat_artifacts,feat_arcana,shards", "limit": "1"})
+    return rows[0] if rows else {}
+
+
+async def db_add_shards(user_id: int, delta: int):
+    # 💎 Осколки: PostgREST без RPC не умеет инкремент — читаем и пишем
+    # (одновременные бои одного пользователя исключены моделью «1 бой»).
+    rows = await _rest("GET", "users", params={
+        "user_id": f"eq.{user_id}", "select": "shards", "limit": "1"})
+    cur = (rows[0].get("shards") or 0) if rows else 0
+    await _rest("PATCH", "users", params={"user_id": f"eq.{user_id}"},
+                json_body={"shards": max(0, cur + delta)})
+
+
+# ---------- артефакты (таблица artifacts) ----------
+
+async def db_user_artifacts(user_id: int):
+    return await _rest("GET", "artifacts", params={
+        "user_id": f"eq.{user_id}", "select": "*", "order": "id.asc"})
+
+
+async def db_add_artifact(user_id: int, d: dict) -> int:
+    rows = await _rest("POST", "artifacts", json_body={
+        "user_id": user_id, "name": d["name"], "stat": d["stat"],
+        "rarity": d.get("rarity", "common"), "level": d.get("level", 1),
+        "equipped_card": 0}, prefer="return=representation")
+    return rows[0]["id"] if rows else 0
+
+
+async def db_get_artifact(art_id: int, user_id: int):
+    rows = await _rest("GET", "artifacts", params={
+        "id": f"eq.{art_id}", "user_id": f"eq.{user_id}", "select": "*", "limit": "1"})
+    return rows[0] if rows else None
+
+
+async def db_patch_artifact(art_id: int, user_id: int, d: dict):
+    await _rest("PATCH", "artifacts",
+                params={"id": f"eq.{art_id}", "user_id": f"eq.{user_id}"},
+                json_body=d)
+
+
+async def db_unequip_card(user_id: int, card_id: int):
+    # Снять ВСЕ артефакты с карты (на карте может быть только один —
+    # перед надеванием нового освобождаем слот)
+    await _rest("PATCH", "artifacts",
+                params={"user_id": f"eq.{user_id}", "equipped_card": f"eq.{card_id}"},
+                json_body={"equipped_card": 0})
+
+
+async def equipped_artifact_bonuses(user_id: int) -> dict:
+    # {card_id: {"attack": N, ...}} — бонусы надетых артефактов для боя.
+    # Вызывается только при включённой фиче (users.feat_artifacts=1).
+    out = {}
+    for a in await db_user_artifacts(user_id):
+        cid = a.get("equipped_card") or 0
+        if cid and a.get("stat") in ART_BASE:
+            out.setdefault(int(cid), {})[a["stat"]] = art_bonus_of(a)
+    return out
 
 
 # =====================================================================
@@ -864,7 +1155,7 @@ def pity_guarantee(counter: int):
     return None
 
 
-def generate_card_data(level: int = 1, rarity: str = None) -> dict:
+def generate_card_data(level: int = 1, rarity: str = None, cls: str = None) -> dict:
     # 0) Редкость (вариант 4): множитель статов ×1.00–×1.20
     if rarity is None:
         rarity = roll_rarity()
@@ -876,8 +1167,9 @@ def generate_card_data(level: int = 1, rarity: str = None) -> dict:
     first_name = random.choice(race["names"])
     last_name = random.choice(race["surnames"])
 
-    # 2) Класс — случайно 50/50
-    cls = random.choice([CLS_WARRIOR, CLS_MAGE])
+    # 2) Класс — случайно 50/50 (или задан явно: cls — для героя)
+    if cls not in (CLS_WARRIOR, CLS_MAGE):
+        cls = random.choice([CLS_WARRIOR, CLS_MAGE])
     base = BASE_STATS[cls]
 
     # 3) Система весов (план п.1.1): повышение одной статы пары на 20%
@@ -916,6 +1208,82 @@ def generate_card_data(level: int = 1, rarity: str = None) -> dict:
     while data["level"] < level:
         apply_level_growth(data)
     return data
+
+
+# =====================================================================
+# 🦸 ГЕНЕРАЦИЯ ГЕРОЯ (редкость «🟧 Героическая»)
+# Перебор персонажей ЭПИЧЕСКОЙ редкости нужного класса, пока выбранная
+# ГЛАВНАЯ СТАТА не окажется большей в своей паре:
+#   пара «Атака ↔ Защита»: защита считается ДЕЛЁННОЙ НА 2 (armor//2);
+#   пара «Здоровье ↔ Скрытность/Точность»: скрытность считается
+#   УМНОЖЕННОЙ НА 4 (sub*4).
+# Победившая карта получает rarity="heroic" (статы остаются как у
+# эпической — множитель ×1.15) и запоминает выбор в hero_main.
+# =====================================================================
+
+def hero_stat_ok(d: dict, stat: str) -> bool:
+    # Является ли stat «главной» (победителем своей пары) у карты d
+    if stat == "attack":
+        return d["attack"] >= d["armor"] // 2
+    if stat == "armor":
+        return d["armor"] // 2 > d["attack"]
+    if stat == "hp":
+        return d["hp_max"] >= d["sub"] * 4
+    if stat == "sub":
+        return d["sub"] * 4 > d["hp_max"]
+    return False
+
+
+def _hero_force_stat(d: dict, stat: str):
+    # Страховка (перебор не сошёлся за HERO_REROLL_LIMIT — на практике
+    # недостижимо): минимально подкручиваем пару, чтобы выбранная стата
+    # гарантированно победила.
+    if stat == "attack" and not hero_stat_ok(d, stat):
+        d["attack"] = d["armor"] // 2 + 1
+    elif stat == "armor" and not hero_stat_ok(d, stat):
+        d["armor"] = d["attack"] * 2 + 2
+    elif stat == "hp" and not hero_stat_ok(d, stat):
+        d["hp_max"] = d["sub"] * 4
+    elif stat == "sub" and not hero_stat_ok(d, stat):
+        d["sub"] = d["hp_max"] // 4 + 1
+
+
+def generate_hero_data(cls: str, stat: str) -> dict:
+    # Данные героя: эпический персонаж выбранного класса, у которого
+    # выбранная стата — главная в своей паре; редкость → heroic.
+    if cls not in (CLS_WARRIOR, CLS_MAGE):
+        cls = CLS_WARRIOR
+    if stat not in dict(HERO_MAIN_STATS[cls]):
+        stat = "attack"
+    best = None
+    for _ in range(HERO_REROLL_LIMIT):
+        d = generate_card_data(rarity="epic", cls=cls)
+        if hero_stat_ok(d, stat):
+            d["rarity"] = "heroic"
+            d["hero_main"] = stat
+            return d
+        best = best or d
+    d = best
+    _hero_force_stat(d, stat)
+    d["rarity"] = "heroic"
+    d["hero_main"] = stat
+    return d
+
+
+def apply_artifact_bonus(u: dict, ab: dict):
+    # 🗡 Надетые артефакты: бонусы вливаются В БОЕВЫЕ СТАТЫ юнита и
+    # запоминаются в u["art_bonus"] — при записи итогов боя в БД они
+    # вычитаются обратно (db_sync_card_after_battle), карта не «впитывает»
+    # артефакт навсегда.
+    if not ab:
+        return
+    u["art_bonus"] = dict(ab)
+    u["attack"] += ab.get("attack", 0)
+    u["armor"] += ab.get("armor", 0)
+    u["armor_base"] += ab.get("armor", 0)
+    u["hp_max"] += ab.get("hp", 0)
+    u["hp"] += ab.get("hp", 0)        # карта входит в бой с бонусным HP
+    u["sub"] += ab.get("sub", 0)
 
 # =====================================================================
 # ИГРОВОЙ ДВИЖОК  (версия с общей доской и перемещениями)
@@ -981,6 +1349,7 @@ def make_unit(d: dict, side: str, uid: int, card_id=None, hp=None) -> dict:
         "uid": uid, "card_id": card_id, "side": side,
         "name": d["name"], "surname": d["surname"], "race": d["race"], "cls": d["cls"],
         "rarity": d.get("rarity", "common"),
+        "arcana": d.get("arcana", ""),   # 🌀 сет арканового персонажа ("" = нет)
         "level": d["level"], "start_level": d["level"],
         "xp": d.get("exp", 0), "xp_gained": 0,
         "attack": d["attack"],
@@ -1006,11 +1375,16 @@ def make_unit(d: dict, side: str, uid: int, card_id=None, hp=None) -> dict:
     }
 
 
-def create_battle(cards, layout_key: str, enemy_rarity: str = None) -> dict:
+def create_battle(cards, layout_key: str, enemy_rarity: str = None,
+                  enemy_level: int = None, artifacts: dict = None) -> dict:
     # cards — строки из БД (боевая колода игрока, до MAX_DECK карт).
     # layout_key — ключ выбранной игроком раскладки из LAYOUTS ("31"/"22"/"13").
     # enemy_rarity — фиксированная редкость колоды противника (для админ-
     # прогонов «против колоды аналогичной редкости»); None — случайная.
+    # enemy_level — фиксированный уровень колоды противника (миссии по
+    # добыче осколков); None — средний уровень колоды игрока.
+    # artifacts — {card_id: {"attack": N, ...}} бонусы надетых артефактов
+    # (🗡 фича включается в админ-панели); None — артефактов нет.
     state = {
         "round": 1, "turn": "player",
         "over": False, "result": None, "rewards_text": "",
@@ -1037,22 +1411,30 @@ def create_battle(cards, layout_key: str, enemy_rarity: str = None) -> dict:
         d = {
             "name": nm, "surname": c["surname"], "race": c["race"], "cls": c["cls"],
             "rarity": c["rarity"] if "rarity" in c.keys() else "common",
+            "arcana": (c.get("arcana") or "") if hasattr(c, "get") else "",
             "level": c["level"], "exp": c["exp"], "attack": c["attack"], "armor": c["armor"],
             "hp_max": c["hp_max"], "sub": c["sub"], "mana_max": c["mana_max"], "end_max": c["end_max"],
             "pending_levels": c.get("pending_levels", 0) or 0,
         }
         u = make_unit(d, "player", state["next_uid"], card_id=c["id"], hp=c["hp"])
+        if artifacts:
+            apply_artifact_bonus(u, artifacts.get(c["id"]))
         state["next_uid"] += 1
         state["player"]["deck"].append(u)
 
     # Колода противника: MAX_DECK случайных карт уровня, равного среднему
     # уровню колоды игрока — чтобы бои не были ни проходными, ни безнадёжными.
+    # (В миссиях уровень задаётся явно: enemy_level = средний + сложность.)
     avg_level = max(1, round(sum(c["level"] for c in cards) / len(cards)))
+    foe_level = max(1, enemy_level or avg_level)
     for _ in range(MAX_DECK):
-        d = generate_card_data(level=avg_level, rarity=enemy_rarity)
+        d = generate_card_data(level=foe_level, rarity=enemy_rarity)
         u = make_unit(d, "enemy", state["next_uid"])
         state["next_uid"] += 1
         state["enemy"]["deck"].append(u)
+    # 🌀 Аркановые связки: ауры пересчитываются при высадке/гибели, но
+    # стартовый пересчёт не помешает (колода пуста — аур не будет).
+    sync_arcana_auras(state)
     return state
 
 
@@ -1245,6 +1627,49 @@ def wall_aura(state: dict, u: dict) -> bool:
     return False
 
 
+# ---------- 🌀 аркановые связки (фича включается в админ-панели) ----------
+
+def arcana_of(u: dict):
+    # Сет арканового персонажа (None — карта обычная). Старые бои из БД
+    # могут не иметь поля — пользуемся .get.
+    key = u.get("arcana") or ""
+    return ARCANA_SETS.get(key)
+
+
+def arcana_aura_active(u: dict) -> bool:
+    # Действует ли аура сета прямо сейчас (маркерный fx с turns=None)
+    arc = arcana_of(u)
+    return arc is not None and has_fx(u, arc["fx"])
+
+
+def sync_arcana_auras(state: dict, side: str = None):
+    # Пересчёт аур аркановых сетов: для каждой стороны считаем ЖИВЫХ на
+    # ПОЛЕ карт каждого сета; если их >= need — каждому участнику сета
+    # вешаем постоянный fx (ауру), иначе снимаем. Вызывается после любого
+    # изменения состава поля: высадка, гибель, отход, начало хода.
+    # Переходы (аура появилась/исчезла) пишутся в журнал боя.
+    for s in (("player", "enemy") if side is None else (side,)):
+        counts = {}
+        for _, _, u in board_units(state, s):
+            arc = arcana_of(u)
+            if arc:
+                counts[arc["fx"]] = counts.get(arc["fx"], 0) + 1
+        for _, _, u in board_units(state, s):
+            arc = arcana_of(u)
+            if arc is None:
+                continue
+            active = counts.get(arc["fx"], 0) >= arc["need"]
+            has = has_fx(u, arc["fx"])
+            if active and not has:
+                add_fx(u, arc["fx"], arc["val"], turns=None)
+                log_add(state, f"{arc['emoji']} АРКАНА «{arc['name']}»: связка "
+                               f"{counts[arc['fx']]}+ на поле — {arc['desc']}")
+            elif not active and has:
+                remove_fx(u, arc["fx"])
+                log_add(state, f"{arc['emoji']} Аркана «{arc['name']}» распалась — "
+                               f"аура {u['name']} снята.")
+
+
 # ---------- статы и формулы (план п.3) ----------
 
 def eff_armor(u: dict, state: dict = None) -> int:
@@ -1257,7 +1682,8 @@ def eff_armor(u: dict, state: dict = None) -> int:
     if u["end"] <= 0 or has_fx(u, "frozen"):
         return 0
     base = u["armor"] // 2 if u.get("retreating") else u["armor"]
-    a = base + fx_sum(u, "buff_armor") - fx_sum(u, "debuff_armor")
+    a = (base + fx_sum(u, "buff_armor") + fx_sum(u, "arc_def")
+         - fx_sum(u, "debuff_armor"))
     if state is not None and u.get("line"):
         cfx = cell_fx_at(state, u["line"], u["pos"])
         if cfx and cfx["kind"] == "swamp":
@@ -1270,8 +1696,9 @@ def eff_armor(u: dict, state: dict = None) -> int:
 
 
 def atk_eff(u: dict, state: dict = None) -> int:
-    # Эффективная Атака (АА) с учётом заклинаний и болота (−25%)
-    a = u["attack"] + fx_sum(u, "buff_attack") - fx_sum(u, "debuff_attack_flat")
+    # Эффективная Атака (АА) с учётом заклинаний, болота (−25%) и 🌀 арканы
+    a = (u["attack"] + fx_sum(u, "buff_attack") + fx_sum(u, "arc_atk")
+         - fx_sum(u, "debuff_attack_flat"))
     pct = fx_sum(u, "debuff_attack_pct")
     if state is not None and u.get("line"):
         cfx = cell_fx_at(state, u["line"], u["pos"])
@@ -1435,6 +1862,7 @@ def kill_unit(state: dict, u: dict):
     u["pos"] = None
     u["retreating"] = False   # погибший «в пути» уже никуда не отходит
     state[u["side"]]["graveyard"].append(u)
+    sync_arcana_auras(state, u["side"])   # 🌀 связка могла распасться
 
 
 def resolve_attack(state: dict, atk: dict, tgt_line: str, tgt_pos: int,
@@ -1637,6 +2065,7 @@ def perform_place(state: dict, side: str, line: str, pos: int, u: dict):
                            f"ход) — преимущество +{FORMULAS['adv']} к ПА.")
             perform_attack(state, side, u, front_line, target[0], stealth=False,
                            free=True, advantage=FORMULAS["adv"])
+    sync_arcana_auras(state, side)   # 🌀 высадка могла собрать связку
 
 
 # ---------- ходы, победа/поражение ----------
@@ -1662,6 +2091,8 @@ def begin_turn(state: dict, side: str):
         u["pos"] = None
         state[side]["deck"].append(u)
         log_add(state, f"🃏 {u['name']} дошёл до колоды — КЗ снова полное ({u['armor']}).")
+    if arrived:
+        sync_arcana_auras(state, side)   # 🌀 ушедший с поля мог разорвать связку
     for u in state[side]["deck"]:
         if u["end"] < u["end_max"]:
             u["end"] += 1
@@ -1671,6 +2102,11 @@ def begin_turn(state: dict, side: str):
         u["defending"] = False
         u["acted_this_turn"] = False
         tick_fx(u)
+        # 🌀 Аркана «Жизнь»: активная аура лечит 2 HP в начале своего хода
+        if u["hp"] > 0 and has_fx(u, "arc_life") and u["hp"] < u["hp_max"]:
+            heal = min(fx_sum(u, "arc_life"), u["hp_max"] - u["hp"])
+            u["hp"] += heal
+            log_add(state, f"🌿 Аркана «Жизнь» лечит {u['name']} на {heal} HP.")
     for line in side_rows(side):
         cellfx = state.get("cell_fx", {}).get(line, {})
         for pos_str in list(cellfx.keys()):
@@ -2000,8 +2436,11 @@ def spellbook_screen(rk: str, page: int):
     label = "🧾 Все" if rk == "all" else rarity_label(rk)
     head += f"\n{label}: {len(sids)} заклинаний · стр. {page + 1}/{n_pages}\n\n"
     text = head + "\n\n".join(spell_line(sid) for sid in chunk)
+    # 🟧 heroic не выводится вкладкой: своих заклинаний у героической
+    # редкости нет — герой просто открывает всю магию до легендарной.
     rows = [[ib("🧾", "spb:all:0")] +
-            [ib(rarity_label(k).split(" ")[0], f"spb:{k}:0") for k in RARITY_KEYS]]
+            [ib(rarity_label(k).split(" ")[0], f"spb:{k}:0")
+             for k in RARITY_KEYS if k != "heroic"]]
     nav = []
     if page > 0:
         nav.append(ib("◀️", f"spb:{rk}:{page - 1}"))
@@ -2721,6 +3160,9 @@ def kb(*rows) -> InlineKeyboardMarkup:
 def unit_flags(u: dict) -> str:
     # Флаги состояния юнита для кнопок и списков
     fl = ""
+    arc = arcana_of(u)
+    if arc:
+        fl += arc["emoji"] + ("✦" if arcana_aura_active(u) else "")  # 🌀 сет; ✦ — аура активна
     if u["defending"]:
         fl += "🔰"
     if u.get("retreating"):
@@ -2842,6 +3284,10 @@ def battle_text(state: dict) -> str:
     else:
         head = (f"⚔️ <b>Раунд {state['round']}</b> · Ваш ход — одно действие\n"
                 f"👹 противник сверху · 🧑 вы снизу")
+    mission = state.get("mission")
+    if mission:
+        head += (f"\n⛏ <b>Миссия: {mission.get('label', 'вылазка')}</b> — "
+                 f"награда за победу: 💎{mission.get('shards', 0)} осколков")
     hint = ""
     pend = state.get("pending")
     if pend:
@@ -2888,10 +3334,21 @@ def unit_info(u: dict) -> str:
     sub_lbl = "🥷 Скрытность" if u["cls"] == CLS_WARRIOR else "🎯 Точность"
     pos_lbl = f" · 📍 {ROW_LABEL[u['line']]}:{u['pos']}" if u.get("line") else ""
     rar = rarity_label(u.get("rarity", "common"))
+    extra = ""
+    arc = arcana_of(u)
+    if arc:
+        extra += (f"\n🌀 Аркана «{arc['name']}» {arc['emoji']}: "
+                  + ("аура активна ✦" if arcana_aura_active(u)
+                     else f"свяжите {arc['need']}+ на поле — {arc['desc']}"))
+    ab = u.get("art_bonus") or {}
+    if ab:
+        icons = {"attack": "⚔", "armor": "🛡", "hp": "❤", "sub": "🥷"}
+        extra += ("\n🗡 Артефакты в бою: "
+                  + " ".join(f"{icons.get(k, '•')}+{v}" for k, v in ab.items() if v))
     return (f"{RACES[u['race']]['emoji']} <b>{u['name']} {u['surname']}</b> · {u['race']}\n"
             f"{rar} · {CLS_NAME[u['cls']]} · ⭐ Уровень {u['level']}{pos_lbl}\n"
             f"❤️ {u['hp']}/{u['hp_max']} · ⚔️ {atk_eff(u)} · 🛡 КЗ {u['armor']} (эфф. {eff_armor(u)})\n"
-            f"{sub_lbl}: {u['sub']} · ⚡ {u['end']}/{u['end_max']}{mana}")
+            f"{sub_lbl}: {u['sub']} · ⚡ {u['end']}/{u['end_max']}{mana}{extra}")
 
 
 def attacker_error(u: dict, stealth: bool):
@@ -2995,69 +3452,58 @@ MENU_TEXT = ("🏠 <b>Главное меню</b>\n\n"
              "📖 Книга заклинаний — справочник магии: статы, стоимость 🔮 и описание эффектов\n"
              "🎲 Получить карту — новая случайная карта\n"
              "⚔️ Бой — сражение с ботом-противником\n"
+             "🦸 Мой герой — личный персонаж 🟧 Героической редкости: класс и главную стату выбираете вы, имя можно поменять сразу\n"
              "👤 Профиль — ник (можно сменить), число карт, победы/ничьи/поражения\n"
              "❓ Помощь — правила игры")
 
-HELP_TEXT = """❓ <b>Правила «Карточных боёв»</b>
+HELP_TEXT = f"""❓ <b>«Карточные бои» — коротко о главном</b>
 
-🃏 <b>Карты и классы</b>
-• <b>Воин ⚔️</b> — ближний бой. Пары стат по системе весов (+20% к одной → −10% к парной): Атака↔Защита(КЗ), Здоровье↔Скрытность.
-• <b>Заклинатель 🔮</b> — дальние заклинания за манну. Пары: Атака↔Запас Манны, Здоровье↔Точность.
-• Карты генерируются случайно: 10 рас, по 20 имён и 20 фамилий на расу (200×200 = 4000 сочетаний). Полные имена в вашей коллекции не повторяются: при исчерпании пула добавляется римский суффикс («Торгрим Железнобород II»). Пока получение карт не ограничено.
-• ✨ РЕДКОСТИ: ⬜ Обычная (50%) / 🟩 Необычная (27%) / 🟦 Редкая (15%) / 🟪 Эпическая (6%) / 🟨 Легендарная (2%). Множитель статов ×1.00–×1.20, высокие редкости открывают сильные заклинания. Гарант (pity) настраивается переменной PITY_CONFIG в начале кода: порог для каждой редкости, -1 = гарант отключён. Сейчас гарант ОТКЛЮЧЁН на все редкости — только честные веса.
-• 📜 ТИТУЛЫ: с 3-го уровня в карточке коллекции можно «Даровать титул» (свой текст). Переключатель 🎭 ставит титул ПЕРЕД именем — так карта видна в бою, колодах и коллекции: «Гроза Юга» Пупкин Васильев.
-• Колоды (до 3): новые карты попадают в КОЛЛЕКЦИЮ (📚). «🃏 Колода» показывает состав, а «🧩 Собрать колоду» открывает режим сборки: вверху — карты, уже добавленные в эту колоду, внизу — вся коллекция со статами, фильтрами и сортировкой (по умолчанию от большего к меньшему). Нажатие на карту добавляет/убирает её в ЭТОЙ колоде — одна и та же карта может лежать в нескольких колодах сразу. ⭐Приоритетная колода идёт в бой без вопроса; если не выбрана — бот спросит при старте (одна непустая колода берётся сама). В бой идут первые 7 карт колоды.
+🚀 <b>Быстрый старт (4 шага)</b>
+1. «🎲 Получить карту» — соберите коллекцию.
+2. «🃏 Колода» → «🧩 Собрать колоду» — отметьте до 7 карт (колод до 3, карта может лежать в нескольких; ⭐ приоритетная идёт в бой без вопроса).
+3. «🦸 Мой герой» — создайте личного героя 🟧 Героической редкости (один раз).
+4. «⚔️ Бой» — выберите колоду и расстановку, дальше всё кликами по клеткам поля.
 
-⚔️ <b>Поле боя — 4 клетки и 4 линии</b>
-• Линии сверху вниз: В2 (тыл врага), В1 (фронт врага), С1 (ваш фронт), С2 (ваш тыл). У каждой стороны по 4 клетки, максимум 3 на линию. Раскладки: 3+1, 2+2 или 1+3.
-• Нумерация: 3 клетки → 1,2,3; 2 клетки → 1 и 3; 1 клетка → 2. Поля перевёрнуты: ваша клетка 1 напротив вражеской 3.
-• Карта — это кнопки: нажимайте прямо на клетки! 👹 — вражеский юнит (в т.ч. прорвавшийся на ваши линии).
+🃏 <b>Карты</b>
+• Два класса: <b>Воин ⚔️</b> (ближний бой; пары стат: Атака↔Защита, Здоровье↔Скрытность) и <b>Заклинатель 🔮</b> (магия за манну; пары: Атака↔Запас Манны, Здоровье↔Точность). Система весов: +20% к одной стате пары → −10% к парной.
+• Редкости: ⬜ 50% · 🟩 27% · 🟦 15% · 🟪 6% · 🟨 2% — множитель статов ×1.00–×1.20; чем выше редкость, тем сильнее доступная магия. 🟧 Героическая — только ваш личный герой (из «🎲» не выпадает). Гарант (pity) настраивается PITY_CONFIG (сейчас выключен).
+• 📜 Титул: с 3-го уровня карточке можно даровать титул; переключатель 🎭 ставит его перед именем («Гроза Юга» Пупкин).
+• 10 рас, имена не повторяются внутри коллекции (двойникам добавляется «II», «III»…).
 
-🚩 <b>Захват клеток = перемещение</b>
-• Персонаж просто ПЕРЕМЕЩАЕТСЯ на пустую клетку своей или СОСЕДНЕЙ линии (В2↔В1↔С1↔С2). Пример: с В1 на С2 за один шаг не попасть.
-• Перемещение стоит 1⚡ выносливости и НЕ тратит манну. Клик по пустой клетке → «кем переместиться?», или «🚶 Переместиться» в меню своего юнита.
+🦸 <b>Мой герой (🟧 Героическая)</b>
+• Создаётся ОДИН раз: «🦸 Мой герой» → класс → главная стата.
+• Главная стата выбирается из пар: ⚔️ Атака против 🛡 Защиты, посчитанной как //2 (атака главнее, если Атака ≥ Защита//2); ❤️ Здоровье против 🥷 Скрытности (🎯 Точности), посчитанной как ×4 (здоровье главнее, если HP ≥ Скрытность×4). Стата выбирается только одна.
+• Герой генерируется перебором ЭПИЧЕСКИХ персонажей выбранного класса, пока выбранная стата не станет большей в своей паре.
+• Имя герою можно задать сразу после создания и менять в любой момент: карточка героя → «✏️ Переименовать».
 
-🎮 <b>Управление</b>
-• Клик по вражескому юниту → выбрать, КЕМ атаковать (⚔️ обычная и/или 🗡 скрытая). Клик по вражеской стене 🧱 → кем сломать.
-• Клик по своему юниту → ДП: Атака / Скрытая атака / 🚶 Перемещение / Защита / Отход / ✨ Магия (у заклинателей). Режимы атаки/перемещения/магии возвращают на поле — следующий клик считается целью (есть «✖ Отменить»; бить союзника нельзя).
-• Скрытая атака всегда спрашивает подтверждение.
-• Клик по пустой клетке → 🚶 переместиться (захват) или 📥 высадить карту из колоды (на своих линиях). Вкладка «🃏 Колода» — внизу.
-• «📖 Книга заклинаний» — раздел главного меню: справочник всех заклинаний (редкость, уровень, цена 🔮, цель, описание эффекта). «👤 Профиль» — внутриигровой ник (можно сменить), число карт и статистика боёв.
-• «✨ Магия» внизу карты боя — книга заклинаний прямо с поля: сначала кастер (видно манну 🔮, выносливость ⚡ и известные заклинания), затем заклинание, затем цель.
-• 🌟 Прокачка — ТОЛЬКО после сыгранного матча: в бою зарабатываются уровни и очки роста, а распределяются они потом в «📚 Коллекция» → раздел «🌟 Ожидают повышения» (очки погибших карт не теряются). Прокачка поднимает только МАКСИМУМЫ статов — ничего не лечит и не восстанавливает.
+⚔️ <b>Бой</b>
+• Поле: 4 линии сверху вниз — В2 (тыл врага), В1 (фронт врага), С1 (ваш фронт), С2 (ваш тыл); у каждой стороны 4 клетки. Раскладки: 3+1, 2+2, 1+3. Ваша клетка 1 стоит напротив вражеской 3.
+• За ход — ОДНО действие: ДП юнита (⚔️ атака, 🗡 скрытая, 🚶 перемещение на пустую клетку своей/соседней линии, 🔰 защита, ↩️ отход в колоду, ✨ магия) ИЛИ 📥 высадка карты из колоды.
+• Всё управление — клики по клеткам: враг → кем бить; свой юнит → меню действий; пустая клетка → переместиться/высадить.
+• Атака при появлении: воин с руки бьёт фронт врага с преимуществом +2 — но только если тот не действовал в свой прошлый ход (в первом раунде не срабатывает).
+• Скрытая атака бьёт через фронт по тылу (В2), КЗ заслона считается как //2.
 
-✨ <b>МАГИЯ (40 заклинаний)</b>
-• Кастуют только ЗАКЛИНАТЕЛИ с поля; заклинания открываются по УРОВНЮ и РЕДКОСТИ карты.
-• Каст тратит СТОИМОСТЬ заклинания (🔮 из справочника), 1⚡ и всё действие хода — остаток пула сохраняется. Манна восстанавливается в колоде (+1🔮 за ход).
-• 🧱 Стена (🟦): своя передняя линия — +3 КЗ вашему тылу, заслон от скрытых атак, блокирует клетку; разрушаема (10 HP, КЗ 12).
-• 🟢 Болото (🟦): клетка врага на 3 хода — стоящий теряет 25% Атаки и 2 КЗ; уход с клетки снимает эффект.
-• ❄️ Заморозка (🟦+): цель не атакует и не кастует, КЗ=0, 1 ход. Спасбросок d20+уровень ≥ 12; иммунитет при КЗ ≥ 20.
-• Магический урон пробивает половину КЗ, но множитель ограничен ×2 — «кнопки победы» нет; контроль всегда проходит через спасброски.
+📐 <b>Формулы (переменные FORMULAS в начале кода)</b>
+• Попадание: ПА = d20 + 3 + 2×уровень. Урон = АА × (1 + 0,1×(ПА − КЗ)) — плавно: промах мимо КЗ уменьшает урон, а не обнуляет (в ноль — при разнице −10 и хуже).
+• Скрытая: ПСА = d20 − 3 + уровень + 2×(🥷|🎯). Защита: КЗ +50% до первого удара. Магия пробивает половину КЗ, множитель ограничен ×2, контроль — через спасбросок d20+уровень ≥ DC (иммунитет при КЗ ≥ 20).
 
-🎲 <b>Ход</b>
-• За ход доступно ОДНО действие: ДП юнита (атака/скрытая/перемещение/защита/отход/магия) ИЛИ высадка карты из колоды. Действия не накапливаются.
+📊 <b>Ресурсы и рост</b>
+• ⚡ Выносливость (старт 4): −1 за любое действие, +1 за ход в колоде; на нуле юнит не действует и его КЗ = 0.
+• 🔮 Манна: атака мага 1, скрытая 2; восстановление только в колоде (+1 за ход).
+• ❤️ Здоровье в бою не лечится (кроме магии); после боя выжившие и павшие восстанавливаются. 💀 Погибшая карта остаётся в коллекции.
+• 😮‍💨 С 40-го раунда — усталость: все на поле теряют HP, бой не может длиться вечно.
+• 🌟 Опыт капает в бою, но уровни распределяются ТОЛЬКО после матча: «📚 Коллекция» → «🌟 Ожидают повышения» → +1 к выбранной стате за очко (рост ничего не лечит).
 
-📐 <b>Формулы</b>
-• Попадание атаки: ПА = d20 + 3 + 2×уровень. Урон = АА × (1 + 0,1×(ПА − КЗ)) — множитель считается ДИНАМИЧЕСКИ с плавающей точкой (режим DAMAGE_MODE="dynamic"): ПА чуть ниже КЗ уменьшает урон (×0,9, ×0,5…), а не обнуляет его; 0 урона — когда множитель стал ≤ 0 (разница −10 и хуже). Все коэффициенты (3, 2, 0,1 и т.д.) — переменные FORMULAS в начале кода.
-• Обычная атака ВОИНА достаёт только линии в пределах ±1 от его позиции (свою и соседние — фронт врага с С1 бьётся, с С2 уже нет: нужно перемещаться). ЗАКЛИНАТЕЛЬ дополнительно всегда достаёт фронт врага (В1) — он бьёт издалека. Прорвавшихся на ваши линии врагов можно бить (своя линия всегда в зоне ±1).
-• Скрытая атака (по тылу В2 через заслон фронта): ПСА = d20 − 3 + уровень + 2×(скрытность|точность); Урон = АА × (1 + 0,1×(ПСА − КЗзаслона//2 − КЗцели)).
-• Защита: КЗ +50% до первого удара по юниту или до начала вашего следующего хода.
-• Отход: карта НАПРАВЛЯЕТСЯ в колоду и добирается туда к началу вашего следующего хода. «В пути» её КЗ вдвое ниже обычного — если противник атакует её в этот промежуток, защищаться ей тяжело. С началом вашего хода карта уже в колоде, а КЗ снова полное (штраф действует только во время отхода).
+⏳ <b>Таймауты (переменные в начале кода, в минутах; 0 = выключено)</b>
+• Бой: BATTLE_TIMEOUT_MIN = {BATTLE_TIMEOUT_MIN} — кулдаун между боями (отсчёт от старта/конца последнего боя).
+• Карта: CARD_TIMEOUT_MIN = {CARD_TIMEOUT_MIN} — кулдаун между получениями карт.
+• Если таймаут задан, бот проверит время при попытке начать бой или получить карту и напишет, сколько осталось ждать. Админ-панель таймаутами не ограничена.
 
-✨ <b>Атака при появлении — только между раундами!</b>
-• Воин, выходя из колоды, автоматически бьёт с преимуществом (+2 к ПА — переменная FORMULAS['adv']) врага на передней линии — НО только если этот враг НЕ совершал действий в свой прошлый ход («застал врасплох»).
-• Поэтому в первом раунде, когда обе стороны только выставляют карты, бонус не срабатывает: свежая карта считается уже действовавшей.
-• Бонус не тратит ни выносливость, ни манну.
-
-📊 <b>Ресурсы</b>
-• ⚡ Выносливость (старт — 4): −1 за каждое действие (включая перемещение), +1 за ход в колоде. На нуле КЗ=0 и карта не может действовать.
-• 🔮 Манна: 1 за атаку заклинателя, 2 за скрытую; восстанавливается только в колоде.
-• ❤️ Здоровье в бою не восстанавливается (кроме магии лечения).
-• 😮‍💨 Усталость: начиная с 40-го раунда юниты на поле теряют HP каждый ход (урон растёт каждые 10 раундов) — бои не затягиваются навсегда.
-• 💀 Погибшая карта выбывает до конца текущего боя, но НЕ исчезает навсегда: после боя восстановится и останется в коллекции.
-• 🌟 Опыт за убийства и итог боя; уровень поднимает попадание сразу, а очко статы вы распределяете сами.
-
-<b>Обозначения на карте</b>: 👹 вражеский юнит/стена · 🔰 держит защиту · 💤 истощён · ❄️ заморожен · ⏳ временная петля · 🧱 стена · 🟢 болото · ⬜ пустая клетка · ▫️ клетки нет."""
+🎛 <b>Прочее</b>
+• «👤 Профиль» — ник и статистика боёв. «📖 Книга заклинаний» — справочник всей магии (40 заклинаний); «✨ Магия» внизу карты боя — каст прямо с поля.
+• 📚 Коллекция: фильтры (класс/колода/редкость/раса/🌟), сортировка по 13 критериям, пагинация.
+• Обозначения: 👹 враг · 🔰 защита · 💤 истощён · ❄️ заморозка · ⏳ петля времени · 🧱 стена (+3 КЗ тылу, заслон) · 🟢 болото (−25% атаки, −2 КЗ) · ⬜ пусто · ▫️ клетки нет.
+• 🗡 Артефакты и 🌀 Арканы — экспериментальные разделы: включаются админом индивидуально; когда включены, их правила появляются в конце этой справки и в профиле."""
 
 
 # ---------------------------------------------------------------------
@@ -3106,18 +3552,74 @@ def pack_pages(text: str, limit: int = HELP_PAGE_LIMIT) -> list:
 
 HELP_PAGES = pack_pages(HELP_TEXT)
 
+# ---------------------------------------------------------------------
+# 🗡 АРТЕФАКТЫ и 🌀 АРКАНЫ — страницы справки для ЭКСПЕРИМЕНТАЛЬНЫХ фич.
+# Показываются (дописываются в конец помощи) только игрокам, которым
+# фича включена индивидуально в админ-панели (users.feat_artifacts /
+# users.feat_arcana). План реализации — Optim1=Help;Hero;TimeOut.md.
+# ---------------------------------------------------------------------
 
-def help_screen(page: int = 0):
+ARTIFACTS_HELP_TEXT = """🗡 <b>Артефакты и миссии (экспериментальная фича)</b>
+
+📿 <b>Что это</b>
+• Артефакт — предмет, который надевается на карту и увеличивает её статы В БОЮ: ⚔️ атака, 🛡 защита, ❤ здоровье или 🥷 скрытность/🎯 точность.
+• На карте может быть надет ОДИН артефакт; у артефакта — одна карта. Бонусы не «впекаются» в карту навсегда: сняли артефакт — статы прежние.
+• Артефакты качаются ОТДЕЛЬНО от карт за 💎 осколки: каждый уровень усиливает бонус (потолок — L10). Чем выше редкость артефакта, тем выше базовый бонус.
+
+💎 <b>Осколки и миссии</b>
+• Осколки добываются в МИССИЯХ: «👤 Профиль» → «🗡 Артефакты» → «⛏ Миссия по добыче». Отряд (ваша боевая колода) уходит на вылазку — это обычный бой с ботом повышенной сложности.
+• 🟢 Лёгкая (враг 🟦 редкий): +8💎 за победу · 🟡 Обычная (🟪 эпический, +1 уровень): +15💎 · 🔴 Тяжёлая (🟨 легендарный, +2 уровня): +30💎. Поражение/ничья — без награды.
+• Между миссиями действует кулдаун MISSION_COOLDOWN_MIN (в минутах).
+
+🛠 <b>Как пользоваться</b>
+• «🧿 Создать» — за 30💎 выберите стату (⚔️/🛡/❤️/🥷) — получите артефакт случайной редкости.
+• Клик по артефакту — «⬆️ Улучшить» (10💎 × уровень), «🃏 Надеть» (выбор карты), «♻️ Снять».
+• Надетые артефакты действуют в обычных боях, в миссиях и в админ-прогоне."""
+
+ARCANA_HELP_TEXT = """🌀 <b>Аркановые персонажи (экспериментальная фича)</b>
+
+• Аркановые персонажи ОЧЕНЬ редкие: при включённой фиче каждая НОВАЯ карта («🎲 Получить карту») с шансом ARCANA_CHANCE_PCT% принадлежит одному из трёх сетов: 🔥 Пламя, 🪨 Камень, 🌿 Жизнь (значок сета виден в коллекции и на поле).
+• Связка: когда на ПОЛЕ БОЯ одновременно стоит 2+ карты одного сета, каждая получает постоянную ауру, пока связка жива:
+  🔥 Пламя — +2 к Атаке;
+  🪨 Камень — +2 к Защите (КЗ);
+  🌿 Жизнь — лечит 2 HP в начале своего хода.
+• Если союзник из связки погибает или уходит с поля — аура спадает (и возвращается, когда связка снова собрана).
+• В списке юнитов и на клетках поля значок сета с «✦» означает: аура сейчас активна.
+• Аркановые карты работают как обычные: их так же можно качать, надевать на них артефакты и собирать из них колоды-связки."""
+
+ARTIFACTS_HELP_PAGES = pack_pages(ARTIFACTS_HELP_TEXT)
+ARCANA_HELP_PAGES = pack_pages(ARCANA_HELP_TEXT)
+
+
+def _help_pages(art: bool = False, arc: bool = False) -> list:
+    # Страницы справки игрока: база + (🗡 артефакты) + (🌀 арканы) —
+    # разделы фич дописываются в конец, только если фичи включены.
+    pages = HELP_PAGES
+    if art:
+        pages = pages + ARTIFACTS_HELP_PAGES
+    if arc:
+        pages = pages + ARCANA_HELP_PAGES
+    return pages
+
+
+def help_screen(page: int = 0, art: bool = False, arc: bool = False):
     # Страница помощи: текст + «📄 Стр. X/Y» + навигация ◀️/▶️ + меню.
-    page = max(0, min(int(page), len(HELP_PAGES) - 1))
-    text = HELP_PAGES[page] + f"\n\n📄 Стр. {page + 1}/{len(HELP_PAGES)}"
+    pages = _help_pages(art, arc)
+    page = max(0, min(int(page), len(pages) - 1))
+    text = pages[page] + f"\n\n📄 Стр. {page + 1}/{len(pages)}"
     nav = []
     if page > 0:
         nav.append(ib("◀️ Назад", f"hlp:{page - 1}"))
     nav.append(ib("🏠 Меню", "mn:home"))
-    if page < len(HELP_PAGES) - 1:
+    if page < len(pages) - 1:
         nav.append(ib("Дальше ▶️", f"hlp:{page + 1}"))
     return text, InlineKeyboardMarkup(inline_keyboard=[nav])
+
+
+async def user_help_flags(user_id: int):
+    # (art, arc) — какие разделы помощи показывать игроку
+    fl = await db_get_flags(user_id)
+    return bool(fl.get("feat_artifacts")), bool(fl.get("feat_arcana"))
 
 
 # =====================================================================
@@ -3134,8 +3636,8 @@ KB_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📚 Коллекция"), KeyboardButton(text="🃏 Колода")],
         [KeyboardButton(text="🎲 Получить карту"), KeyboardButton(text="⚔️ Бой")],
-        [KeyboardButton(text="📖 Книга заклинаний"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="🦸 Мой герой"), KeyboardButton(text="📖 Книга заклинаний")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
 )
@@ -3237,10 +3739,12 @@ async def msg_battle(m: Message):
 async def msg_help(m: Message):
     # Баг-фикс заказа («message is too long»): HELP_TEXT длиннее лимита
     # Telegram 4096 символов — помощь выдаётся СТРАНИЦАМИ (HELP_PAGES),
-    # листание кнопками ◀️/▶️ (колбэк hlp:{страница}).
+    # листание кнопками ◀️/▶️ (колбэк hlp:{страница}). Разделы 🗡/🌀 —
+    # только если игроку включены экспериментальные фичи.
     if not await ensure_access_msg(m):
         return
-    text, markup = help_screen(0)
+    art, arc = await user_help_flags(m.from_user.id)
+    text, markup = help_screen(0, art, arc)
     await m.answer(text, reply_markup=markup)
 
 
@@ -3249,7 +3753,8 @@ async def cmd_help(m: Message):
     # /help — та же постраничная помощь, что и кнопка «❓ Помощь»
     if not await ensure_access_msg(m):
         return
-    text, markup = help_screen(0)
+    art, arc = await user_help_flags(m.from_user.id)
+    text, markup = help_screen(0, art, arc)
     await m.answer(text, reply_markup=markup)
 
 
@@ -3266,19 +3771,28 @@ async def msg_spellbook(m: Message):
 async def profile_screen(user_id: int):
     # «👤 Профиль»: внутриигровой ник (можно менять), число карт и
     # статистика боёв. Ник по умолчанию — telegram-@username.
+    # 🗡/🌀 Экспериментальные фичи (включаются в админ-панели): кнопка
+    # «Артефакты» и счётчик аркановых карт — только когда включены.
     p = await db_get_profile(user_id) or {}
     cards = await db_user_cards(user_id)
+    fl = await db_get_flags(user_id)
     nick = (p.get("nickname") or "").strip() or (p.get("username") or "").strip() or "Без имени"
     text = ("👤 <b>Профиль</b>\n\n"
             f"🏷 Ник: <b>{nick}</b>\n"
-            f"🃏 Карт в коллекции: {len(cards)}\n\n"
-            "⚔️ <b>Статистика боёв</b>\n"
-            f"🏆 Побед: {p.get('wins') or 0}\n"
-            f"🤝 Ничьих: {p.get('draws') or 0}\n"
-            f"☠️ Поражений: {p.get('losses') or 0}\n\n"
-            "<i>Побег с поля считается поражением.</i>")
-    markup = kb([ib("✏️ Сменить ник", "nick")], [ib("🏠 Меню", "mn:home")])
-    return text, markup
+            f"🃏 Карт в коллекции: {len(cards)}\n")
+    if fl.get("feat_arcana"):
+        arc_n = sum(1 for c in cards if (c.get("arcana") or "") in ARCANA_SETS)
+        text += f"🌀 Аркановых карт: {arc_n}\n"
+    text += ("\n⚔️ <b>Статистика боёв</b>\n"
+             f"🏆 Побед: {p.get('wins') or 0}\n"
+             f"🤝 Ничьих: {p.get('draws') or 0}\n"
+             f"☠️ Поражений: {p.get('losses') or 0}\n\n"
+             "<i>Побег с поля считается поражением.</i>")
+    rows = [[ib("✏️ Сменить ник", "nick")]]
+    if fl.get("feat_artifacts"):
+        rows.append([ib(f"🗡 Артефакты (💎{fl.get('shards') or 0})", "art:0")])
+    rows.append([ib("🏠 Меню", "mn:home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(F.text == "👤 Профиль")
@@ -3287,6 +3801,208 @@ async def msg_profile(m: Message):
         return
     text, markup = await profile_screen(m.from_user.id)
     await m.answer(text, reply_markup=markup)
+
+
+# =====================================================================
+# 🦸 МОЙ ГЕРОЙ — собственный персонаж игрока (🟧 Героическая редкость)
+# =====================================================================
+# Создаётся ОДИН раз: игрок выбирает класс и ГЛАВНУЮ СТАТУ (ровно одну),
+# карта генерируется перебором ЭПИЧЕСКИХ персонажей, пока выбранная стата
+# не победит в своей паре (защита считается //2 к атаке; скрытность/
+# точность — ×4 к здоровью), затем получает редкость «heroic». Имя можно
+# поменять СРАЗУ (бот спрашивает после создания) и потом — кнопкой
+# «✏️ Переименовать» в карточке героя. Состояние «ждём имя» — в БД
+# (users.awaiting_hero_name = id карты), как у титула/ника (без FSM).
+# =====================================================================
+
+async def hero_card_row(user_id: int):
+    # Карта героя игрока (первая 🟧 Героическая в коллекции) или None
+    for c in await db_user_cards(user_id):
+        if (c.get("rarity") or "common") == "heroic":
+            return c
+    return None
+
+
+def hero_intro_screen():
+    # Первый шаг создания героя — выбор класса
+    text = ("🦸 <b>Мой герой</b>\n\n"
+            "У вас ещё нет собственного персонажа. Герой — уникальная карта "
+            "🟧 <b>Героической</b> редкости: класс и главную стату выбираете вы, "
+            "а имя можно поменять сразу после создания.\n\n"
+            "Шаг 1/3 — выберите <b>класс</b>:")
+    return text, kb([ib("⚔️ Воин", "heroc:warrior"), ib("🔮 Заклинатель", "heroc:mage")],
+                    [ib("🏠 Меню", "mn:home")])
+
+
+def hero_stat_screen(cls: str):
+    # Второй шаг — выбор ГЛАВНОЙ СТАТЫ (ровно одной). Пары и правила
+    # сравнения: атака vs защита//2; здоровье vs скрытность(точность)×4.
+    if cls == CLS_MAGE:
+        pairs = ("Пары стат героя: ⚔️ Атака ↔ 🔮 Запас Манны и ❤️ Здоровье ↔ 🎯 Точность "
+                 "(точность считается ×4 к здоровью). Защита у заклинателя в паре "
+                 "с атакой не участвует — она не может быть главной.")
+    else:
+        pairs = ("Пары стат героя: ⚔️ Атака ↔ 🛡 Защита (защита считается //2 — "
+                 "атака главнее, если Атака ≥ Защита//2) и ❤️ Здоровье ↔ 🥷 Скрытность "
+                 "(скрытность считается ×4 — здоровье главнее, если HP ≥ Скрытность×4).")
+    text = ("🦸 <b>Мой герой</b> · " + CLS_NAME[cls] + "\n\n"
+            "Шаг 2/3 — выберите <b>главную стату</b> (только одну). Герой будет "
+            "сгенерирован перебором эпических персонажей, пока выбранная стата "
+            "не станет большей в своей паре.\n\n" + pairs)
+    rows = [[ib(lbl, f"herogo:{cls}:{code}")] for code, lbl in HERO_MAIN_STATS[cls]]
+    rows.append([ib("⬅️ Назад", "hero:")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def create_hero(user_id: int, cls: str, stat: str):
+    # Шаг 3/3 — генерация героя и сохранение в коллекцию. Возвращает
+    # (cid, row). Имя: сначала сгенерированное уникальное — сразу после
+    # создания бот предлагает игроку ввести своё (users.awaiting_hero_name).
+    d = generate_hero_data(cls, stat)
+    for _ in range(8):
+        if not await db_name_taken(user_id, d["name"], d["surname"]):
+            break
+        d = generate_hero_data(cls, stat)
+    else:
+        n = 2
+        while await db_name_taken(user_id, d["name"], f"{d['surname']} {roman_numeral(n)}"):
+            n += 1
+        d["surname"] = f"{d['surname']} {roman_numeral(n)}"
+    cid = await db_add_card(user_id, d)
+    row = await db_get_card(cid, user_id)
+    return cid, row
+
+
+def hero_rename_prompt(cid: int, row, ctx: str = "all", page: str = "0"):
+    # Экран ввода имени героя (ожидание — users.awaiting_hero_name = cid)
+    return (f"✏️ <b>Имя героя</b> · {disp_name(row)}\n\n"
+            "Отправьте новое имя обычным сообщением (до 32 символов; "
+            "символы «&lt;» «&gt;» «&amp;» будут вырезаны). Имя заменит связку "
+            "«имя + фамилия» целиком.\n"
+            "Отмена — /cancel (текущее имя останется).",
+            kb([ib("⬅️ Отменить", f"hrnc:{cid}:{ctx}:{page}")]))
+
+
+@router.message(F.text == "🦸 Мой герой")
+async def msg_hero(m: Message):
+    if not await ensure_access_msg(m):
+        return
+    row = await hero_card_row(m.from_user.id)
+    if row is None:
+        text, markup = hero_intro_screen()
+    else:
+        text = ("🦸 <b>Ваш герой</b> (🟧 Героическая редкость — собственный "
+                "персонаж; второго создать нельзя, но героя можно качать, "
+                "титуловать и переименовывать):\n\n" + card_text(row))
+        markup = card_kb(row, "all", "0")
+    await m.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "hero:")
+async def cb_hero_intro(call: CallbackQuery):
+    # Вход в создание героя (кнопка «⬅️ Назад» из выбора статы и т.п.)
+    row = await hero_card_row(call.from_user.id)
+    await safe_answer(call)
+    if row is not None:
+        await safe_edit(call, "🦸 <b>Ваш герой</b>:\n\n" + card_text(row),
+                        card_kb(row, "all", "0"))
+        return
+    text, markup = hero_intro_screen()
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("heroc:"))
+async def cb_hero_class(call: CallbackQuery):
+    # Шаг 1 → 2: выбран класс, предлагаем главные статы
+    cls = call.data.split(":")[1]
+    if cls not in HERO_MAIN_STATS:
+        await safe_answer(call, "Неизвестный класс.", show_alert=True)
+        return
+    if await hero_card_row(call.from_user.id) is not None:
+        await safe_answer(call, "Герой уже создан — он ждёт вас в «🦸 Мой герой».",
+                          show_alert=True)
+        return
+    await safe_answer(call)
+    text, markup = hero_stat_screen(cls)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("herogo:"))
+async def cb_hero_create(call: CallbackQuery):
+    # Шаг 2 → 3: генерация героя + сразу предлагаем поменять имя
+    parts = call.data.split(":")
+    cls, stat = parts[1], parts[2]
+    uid = call.from_user.id
+    if cls not in HERO_MAIN_STATS or stat not in dict(HERO_MAIN_STATS[cls]):
+        await safe_answer(call, "Неверный класс или стата.", show_alert=True)
+        return
+    if await hero_card_row(uid) is not None:
+        await safe_answer(call, "Герой уже создан.", show_alert=True)
+        return
+    await safe_answer(call, "🦸 Создаю героя…")
+    cid, row = await create_hero(uid, cls, stat)
+    if row is None:
+        await safe_edit(call, "Не удалось сохранить героя — попробуйте ещё раз.",
+                        kb([ib("🦸 Мой герой", "hero:")], [ib("🏠 Меню", "mn:home")]))
+        return
+    await set_user_flag(uid, "awaiting_hero_name", int(cid))
+    stat_lbl = HERO_STAT_LABEL.get(stat, stat)
+    await safe_edit(call, "🎉🟧 <b>ГЕРОЙ СОЗДАН!</b> 🟧🎉\n\n" + card_text(row) +
+                    f"\n\n👑 Главная стата: <b>{stat_lbl}</b> — она победила в своей паре.\n"
+                    "Шаг 3/3 — <b>имя</b>: отправьте его обычным сообщением "
+                    "(или /skip — оставить сгенерированное). Потом имя можно "
+                    "сменить в любой момент: карточка героя → «✏️ Переименовать».",
+                    kb([ib("⏭ Оставить это имя", "hrnskip")], [ib("🏠 Меню", "mn:home")]))
+
+
+@router.callback_query(F.data.startswith("hrn:"))
+async def cb_hero_rename_ask(call: CallbackQuery):
+    # «✏️ Переименовать» из карточки героя (только 🟧 heroic)
+    _, cid, ctx, page = call.data.split(":")
+    uid = call.from_user.id
+    row = await db_get_card(int(cid), uid)
+    if not row:
+        await safe_answer(call, "Карта не найдена.", show_alert=True)
+        return
+    if (row.get("rarity") or "common") != "heroic":
+        await safe_answer(call, "Переименовать можно только героя "
+                                "(🟧 Героическая редкость).", show_alert=True)
+        return
+    await set_user_flag(uid, "awaiting_hero_name", int(cid))
+    await safe_answer(call)
+    text, markup = hero_rename_prompt(int(cid), row, ctx, page)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data == "hrnskip")
+async def cb_hero_name_skip(call: CallbackQuery):
+    # «⏭ Оставить это имя» сразу после создания героя
+    cid = await user_flag(call.from_user.id, "awaiting_hero_name")
+    await set_user_flag(call.from_user.id, "awaiting_hero_name", 0)
+    row = await db_get_card(int(cid), call.from_user.id) if cid else None
+    await safe_answer(call, "Имя оставлено")
+    if row is None:
+        await safe_edit(call, MENU_TEXT, None)
+        return
+    await safe_edit(call, "🦸 <b>Готово!</b> Герой ждёт вас в коллекции — "
+                    "соберите колоду и в бой.\n\n" + card_text(row),
+                    kb([ib("✏️ Переименовать", f"hrn:{row['id']}:all:0")],
+                       [ib("🃏 Колода", "dk:1:0"), ib("📚 Коллекция", "col:all:0")],
+                       [ib("🏠 Меню", "mn:home")]))
+
+
+@router.callback_query(F.data.startswith("hrnc:"))
+async def cb_hero_rename_cancel(call: CallbackQuery):
+    # «⬅️ Отменить» на экране ввода имени героя
+    _, cid, ctx, page = call.data.split(":")
+    await set_user_flag(call.from_user.id, "awaiting_hero_name", 0)
+    row = await db_get_card(int(cid), call.from_user.id)
+    await safe_answer(call, "Переименование отменено")
+    if row:
+        await safe_edit(call, card_text(row), card_kb(row, ctx, page))
+    else:
+        text, markup = await ctx_screen(call.from_user.id, ctx, page)
+        await safe_edit(call, text, markup)
 
 
 @router.callback_query(F.data.startswith("spb:"))
@@ -3352,6 +4068,23 @@ async def msg_catchall(m: Message):
         else:
             await m.answer("❌ Неверный админ-пароль.", reply_markup=KB_MENU)
         return
+    if await user_flag(uid, "awaiting_feat"):
+        # 🧪 Админ ввёл «Другому игроку (по ID)» — ждём числовой Telegram ID,
+        # затем показываем экран индивидуальных фич этого игрока.
+        if text.lower() in ("/cancel", "отмена"):
+            await set_user_flag(uid, "awaiting_feat", 0)
+            await m.answer("🧪 Ввод ID отменён.", reply_markup=KB_MENU)
+            return
+        if not text.isdigit():
+            await m.answer("🧪 Нужен ЧИСЛОВОЙ Telegram ID игрока "
+                           "(или /cancel для отмены).")
+            return
+        await set_user_flag(uid, "awaiting_feat", 0)
+        target = int(text)
+        await ensure_user_row(target)
+        ftext, fmarkup = await feat_screen(target)
+        await m.answer(ftext, reply_markup=fmarkup)
+        return
     t_card = await user_flag(uid, "awaiting_title")
     if t_card:
         # Ждём текст титула для карты №t_card (кнопка «📜 Даровать титул»)
@@ -3372,6 +4105,45 @@ async def msg_catchall(m: Message):
             return
         await m.answer(f"📜 Титул <b>«{title}»</b> дарован! Использовать его как имя — "
                        "переключатель 🎭 на карточке.\n\n" + card_text(row),
+                       reply_markup=card_kb(row, "all", "0"))
+        return
+    h_card = await user_flag(uid, "awaiting_hero_name")
+    if h_card:
+        # Ждём новое имя ГЕРОЯ (🦸) — карта №h_card (🟧 heroic).
+        # «/skip» и «пропустить» — оставить сгенерированное имя (шаг 3/3
+        # создания героя); «/cancel» — отмена переименования.
+        row = await db_get_card(int(h_card), uid)
+        if text.lower() in ("/cancel", "отмена"):
+            await set_user_flag(uid, "awaiting_hero_name", 0)
+            if row:
+                await m.answer("✏️ Переименование героя отменено.\n\n" + card_text(row),
+                               reply_markup=card_kb(row, "all", "0"))
+            else:
+                await m.answer("✏️ Переименование отменено.", reply_markup=KB_MENU)
+            return
+        if text.lower() in ("/skip", "skip", "пропустить"):
+            await set_user_flag(uid, "awaiting_hero_name", 0)
+            if row:
+                await m.answer("🦸 <b>Имя оставлено.</b> Герой готов — переименовать "
+                               "можно в любой момент кнопкой «✏️ Переименовать».\n\n"
+                               + card_text(row), reply_markup=card_kb(row, "all", "0"))
+            else:
+                await m.answer("🦸 Имя оставлено.", reply_markup=KB_MENU)
+            return
+        name = sanitize_hero_name(text)
+        if not name:
+            await m.answer("✏️ Имя не может быть пустым (символы «&lt;» «&gt;» «&amp;» "
+                           "не допускаются). Отправьте другой текст, /skip или /cancel.")
+            return
+        if row is None or (row.get("rarity") or "common") != "heroic":
+            await set_user_flag(uid, "awaiting_hero_name", 0)
+            await m.answer("Карта героя не найдена — имя не сохранено.",
+                           reply_markup=KB_MENU)
+            return
+        await db_rename_card(int(h_card), name, uid)
+        await set_user_flag(uid, "awaiting_hero_name", 0)
+        row = await db_get_card(int(h_card), uid)
+        await m.answer(f"🦸 <b>Герой переименован: {name}!</b>\n\n" + card_text(row),
                        reply_markup=card_kb(row, "all", "0"))
         return
     if await user_flag(uid, "awaiting_nick"):
@@ -3397,7 +4169,8 @@ async def msg_catchall(m: Message):
 async def cb_help_page(call: CallbackQuery):
     # Листание страниц помощи (◀️/▶️): hlp:{номер страницы}
     n = call.data.split(":")[1]
-    text, markup = help_screen(int(n) if n.isdigit() else 0)
+    art, arc = await user_help_flags(call.from_user.id)
+    text, markup = help_screen(int(n) if n.isdigit() else 0, art, arc)
     await safe_answer(call)
     await safe_edit(call, text, markup)
 
@@ -3538,10 +4311,19 @@ def card_text(row) -> str:
     pend = (row.get("pending_levels") or 0) if hasattr(row, "get") else 0
     pend_line = (f"\n🌟 Очков роста: {pend} — распределите кнопкой ниже "
                  "(прокачка только после матча)" if pend > 0 else "")
+    hero_line = ""
+    hm = (row.get("hero_main") or "") if hasattr(row, "get") else ""
+    if hm in HERO_STAT_LABEL:
+        hero_line = f"\n👑 Главная стата героя: {HERO_STAT_LABEL[hm]}"
+    arc_line = ""
+    arc = ARCANA_SETS.get((row.get("arcana") or "") if hasattr(row, "get") else "")
+    if arc:
+        arc_line = f"\n🌀 Аркана «{arc['name']}» {arc['emoji']}: {arc['desc']}"
     return "\n".join([
         f"🃏 <b>{disp_name(row)}</b> · #{row['id']}",
         f"{rarity_label(rarity)} · {RACES[row['race']]['emoji']} {row['race']} · {CLS_NAME[row['cls']]}",
-        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}{title_line}{pend_line}",
+        f"⭐ Уровень {row['level']} · Опыт {row['exp']}/{xp_to_next(row['level'])}"
+        f"{hero_line}{title_line}{arc_line}{pend_line}",
         "",
         f"⚔️ Атака (АА): {row['attack']}",
         f"❤️ Здоровье: {row['hp']}/{row['hp_max']}",
@@ -3561,6 +4343,9 @@ def card_kb(row, ctx: str, page: str) -> InlineKeyboardMarkup:
     cur = f" (сейчас {', '.join(f'№{n}' for n in ns)})" if ns else ""
     rows = [[ib(f"📥 В колоду…{cur}"[:64], f"dks:{cid}:{ctx}:{page}")],
             [ib("🗑 Сбросить карту", f"dkd:{cid}:{ctx}:{page}")]]
+    # 🦸 Героя (🟧 heroic) можно переименовать в любой момент
+    if ((row.get("rarity") if hasattr(row, "get") else row["rarity"]) or "common") == "heroic":
+        rows.insert(0, [ib("✏️ Переименовать героя", f"hrn:{cid}:{ctx}:{page}")])
     pend = (row.get("pending_levels") or 0) if hasattr(row, "get") else 0
     if pend > 0:
         # Прокачка только после матча: отложенные очки распределяются здесь
@@ -4213,6 +4998,16 @@ async def cb_delete_yes(call: CallbackQuery):
 async def get_new_card(user_id: int):
     # Генерация новой карты. Ограничение колоды сейчас ОТКЛЮЧЕНО
     # (DECK_LIMIT_ENABLED=False) — по заданию кнопка работает без лимита.
+    # ⏳ ТАЙМАУТ (CARD_TIMEOUT_MIN, минут; 0 = выключен): перед выдачей
+    # проверяем, сколько прошло с последнего получения (users.last_card_at).
+    if CARD_TIMEOUT_MIN > 0:
+        left = cooldown_left(await db_get_stamp(user_id, "last_card_at"),
+                             CARD_TIMEOUT_MIN)
+        if left > 0:
+            return (f"⏳ <b>Таймаут получения карт</b>\n\n"
+                    f"Следующая карта будет доступна через <b>{fmt_left(left)}</b> "
+                    f"(CARD_TIMEOUT_MIN = {CARD_TIMEOUT_MIN}).",
+                    kb([ib("🏠 Меню", "mn:home")]))
     if DECK_LIMIT_ENABLED:
         cards = await db_user_cards(user_id)
         if len(cards) >= MAX_DECK:
@@ -4247,11 +5042,24 @@ async def get_new_card(user_id: int):
         while await db_name_taken(user_id, d["name"], f"{d['surname']} {roman_numeral(n)}"):
             n += 1
         d["surname"] = f"{d['surname']} {roman_numeral(n)}"
+    # 🌀 АРКАНА (фича включается в админ-панели индивидуально): с шансом
+    # ARCANA_CHANCE_PCT% новая карта становится аркановой — принадлежит
+    # случайному сету и даёт ауру связке на поле боя.
+    arc_hit = None
+    if ARCANA_CHANCE_PCT > 0 and await user_flag(user_id, "feat_arcana"):
+        if random.randint(1, 100) <= ARCANA_CHANCE_PCT:
+            d["arcana"] = random.choice(ARCANA_KEYS)
+            arc_hit = ARCANA_SETS[d["arcana"]]
     cid = await db_add_card(user_id, d)
+    if CARD_TIMEOUT_MIN > 0:
+        await db_stamp(user_id, "last_card_at")   # ⏳ метка для кулдауна
     if pity_active:
         await set_user_flag(user_id, "pity", pity)
     row = await db_get_card(cid, user_id)
-    if d["rarity"] == "legendary":
+    if arc_hit:
+        fanf = (f"🌀✨ <b>АРКАНОВАЯ КАРТА!</b> ✨🌀\nСет «{arc_hit['name']}» "
+                f"{arc_hit['emoji']}: {arc_hit['desc']}\n\n")
+    elif d["rarity"] == "legendary":
         fanf = "🎉🟨 <b>ЛЕГЕНДАРНАЯ КАРТА!</b> 🟨🎉\n\n"
     elif d["rarity"] == "epic":
         fanf = "🌟 <b>Эпическая карта!</b>\n\n"
@@ -4291,6 +5099,17 @@ async def battle_setup_screen(user_id: int, deck: int = 0, force_pick: bool = Fa
     #  • колода передана явно (deck>0) — сразу выбор раскладки;
     #  • не передана — берём ⭐приоритетную; если её нет и колода одна —
     #    берём её без вопросов; иначе спрашиваем, какая колода идёт в бой.
+    # ⏳ ТАЙМАУТ (BATTLE_TIMEOUT_MIN, минут; 0 = выключен): если с прошлого
+    # боя прошло меньше нормы — подготовка даже не открывается. Активный
+    # бой можно продолжать всегда (проверяется у вызывающих хендлеров).
+    if BATTLE_TIMEOUT_MIN > 0:
+        left = cooldown_left(await db_get_stamp(user_id, "last_battle_at"),
+                             BATTLE_TIMEOUT_MIN)
+        if left > 0:
+            return (f"⏳ <b>Таймаут боёв</b>\n\nОтряд отдыхает — следующий бой "
+                    f"будет доступен через <b>{fmt_left(left)}</b> "
+                    f"(BATTLE_TIMEOUT_MIN = {BATTLE_TIMEOUT_MIN}).",
+                    kb([ib("👤 Профиль", "prof")], [ib("🏠 Меню", "mn:home")]))
     all_cards = await db_user_cards(user_id)
     if not all_cards:
         return ("⚔️ <b>У вас пока нет карт!</b>\n\nПолучите первую карту — "
@@ -4356,14 +5175,30 @@ async def cb_battle_start(call: CallbackQuery):
     if await db_load_battle(user_id):
         await safe_answer(call, "У вас уже идёт бой!", show_alert=True)
         return
+    # ⏳ Контрольная проверка таймаута (кнопка могла «дожить» с экрана,
+    # показанного до включения/срабатывания кулдауна)
+    if BATTLE_TIMEOUT_MIN > 0:
+        left = cooldown_left(await db_get_stamp(user_id, "last_battle_at"),
+                             BATTLE_TIMEOUT_MIN)
+        if left > 0:
+            await safe_answer(call, f"⏳ Бой будет доступен через {fmt_left(left)}.",
+                              show_alert=True)
+            return
     cards = await db_battle_cards(user_id, deck)
     if not cards:
         await safe_answer(call, "Колода пуста! Добавьте карты: «🃏 Колода».", show_alert=True)
         return
-    state = create_battle(cards, layout_key)
+    # 🗡 Артефакты (фича включается в админ-панели): бонусы надетых
+    # артефактов вливаются в боевые статы отряда.
+    artifacts = None
+    if await user_flag(user_id, "feat_artifacts"):
+        artifacts = await equipped_artifact_bonuses(user_id)
+    state = create_battle(cards, layout_key, artifacts=artifacts)
     log_add(state, f"⚔️ Бой начался (колода №{deck})! Нажмите на клетку поля, "
                    "чтобы действовать. Удачи!")
     await db_save_battle(user_id, state)
+    if BATTLE_TIMEOUT_MIN > 0:
+        await db_stamp(user_id, "last_battle_at")   # ⏳ отсчёт кулдауна
     await safe_answer(call)
     await safe_edit(call, battle_text(state), kb_battle(state))
 
@@ -4447,6 +5282,24 @@ async def end_battle(user_id: int, state: dict) -> bool:
     if not state.get("result_recorded"):
         state["result_recorded"] = True
         await db_add_result(user_id, state["result"])
+    # ⏳ Метка кулдауна боёв: отсчёт BATTLE_TIMEOUT_MIN ведётся от
+    # ПОСЛЕДНЕГО события — старта или завершения боя (здесь — завершение).
+    if BATTLE_TIMEOUT_MIN > 0:
+        await db_stamp(user_id, "last_battle_at")
+    # ⛏ Миссия по добыче (🗡 артефакты): осколки — только за ПОБЕДУ.
+    # Начисление ПОСЛЕ удаления боя (та же защита от двойной финализации,
+    # что у db_add_result) + флаг mission_paid в состоянии.
+    mission = state.get("mission")
+    if mission and not state.get("mission_paid"):
+        state["mission_paid"] = True
+        if state["result"] == "victory":
+            shards = int(mission.get("shards") or 0)
+            await db_add_shards(user_id, shards)
+            lines.append(f"💎 <b>Миссия выполнена</b>: +{shards} осколков — на создание "
+                         "и улучшение артефактов («👤 Профиль» → «🗡 Артефакты»).")
+        else:
+            lines.append("⛏ Миссия провалена — отряд возвращается ни с чем "
+                         "(осколки начисляются только за победу).")
     if HEAL_AFTER_BATTLE and lost < len(units):
         lines.append("❤️ Выжившие карты вылечены.")
     total_pend = pending_levels_total(state)
@@ -5387,6 +6240,383 @@ async def cb_flee_do(call: CallbackQuery):
 
 
 # =====================================================================
+# 🗡 АРТЕФАКТЫ И ⛏ МИССИИ ПО ДОБЫЧЕ (экспериментальная фича)
+# =====================================================================
+# Включается ТОЛЬКО в админ-панели и ИНДИВИДУАЛЬНО (users.feat_artifacts).
+# План реализации — Optim1=Help;Hero;TimeOut.md, раздел «Артефакты».
+#
+# Цикл: ⛏ миссия (бой отряда с ботом повышенной сложности) → 💎 осколки
+#       за победу → 🧿 создание / ⬆️ улучшение артефактов → 🃏 надеть на
+#       карту → бонус к статам в следующем бою.
+# Ограничения: 1 артефакт на карту, 1 карта у артефакта; бонусы живут
+# только в бою и вычитаются при записи итогов в БД (см. art_bonus /
+# db_sync_card_after_battle) — карта не «впитывает» артефакт навсегда.
+# =====================================================================
+
+ARTS_PER_PAGE = 8
+ART_STAT_ICON = {"attack": "⚔️", "armor": "🛡", "hp": "❤️", "sub": "🥷"}
+
+
+async def _art_ok(call: CallbackQuery) -> bool:
+    # Страж фичи: артефакты доступны только с флагом из админ-панели
+    if not await user_flag(call.from_user.id, "feat_artifacts"):
+        await safe_answer(call, "🗡 Артефакты — экспериментальная функция. "
+                                "Её включает админ индивидуально (админ-панель "
+                                "→ «🧪 Фичи»).", show_alert=True)
+        return False
+    return True
+
+
+def artifact_line(a, cards=None) -> str:
+    # Артефакт в одну строку (список/детали)
+    stat = a["stat"] if a.get("stat") in ART_BASE else "attack"
+    ico = ART_STAT_ICON.get(stat, "•")
+    rem = rarity_label(a.get("rarity") or "common").split(" ")[0]
+    eq = ""
+    cid = a.get("equipped_card") or 0
+    if cid and cards:
+        c = next((x for x in cards if x["id"] == cid), None)
+        if c:
+            eq = f" → {disp_name(c)}"
+    return f"{ico} {a['name']} {rem} L{a.get('level') or 1} (+{art_bonus_of(a)}){eq}"
+
+
+async def artifacts_screen(user_id: int, page: int = 0):
+    # «🗡 Артефакты»: баланс осколков, список артефактов (пагинация),
+    # создание и вход в миссии.
+    fl = await db_get_flags(user_id)
+    shards = fl.get("shards") or 0
+    arts = await db_user_artifacts(user_id)
+    cards = await db_user_cards(user_id)
+    lines = [f"🗡 <b>Артефакты</b> · 💎 осколков: <b>{shards}</b>", ""]
+    rows = []
+    if arts:
+        n_pages = max(1, (len(arts) + ARTS_PER_PAGE - 1) // ARTS_PER_PAGE)
+        page = max(0, min(int(page), n_pages - 1))
+        lines.append("Ваши артефакты (нажмите — улучшить/надеть):")
+        for a in arts[page * ARTS_PER_PAGE:(page + 1) * ARTS_PER_PAGE]:
+            lines.append("• " + artifact_line(a, cards))
+            rows.append([ib(artifact_line(a)[:64], f"arta:{a['id']}:{page}")])
+        nav = []
+        if page > 0:
+            nav.append(ib("◀️", f"art:{page - 1}"))
+        if page < n_pages - 1:
+            nav.append(ib("▶️", f"art:{page + 1}"))
+        if nav:
+            rows.append(nav)
+    else:
+        page = 0
+        lines.append("Артефактов пока нет — создайте первый за осколки "
+                     f"(💎{shards}/{ART_CRAFT_COST}) или добудьте осколки в миссии.")
+    rows.append([ib(f"🧿 Создать артефакт ({ART_CRAFT_COST}💎)", "artcraft"),
+                 ib("⛏ Миссия по добыче", "artm")])
+    rows.append([ib("👤 Профиль", "prof"), ib("🏠 Меню", "mn:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("art:"))
+async def cb_artifacts(call: CallbackQuery):
+    if not await _art_ok(call):
+        return
+    page = call.data.split(":")[1]
+    text, markup = await artifacts_screen(call.from_user.id,
+                                          int(page) if page.isdigit() else 0)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data == "artcraft")
+async def cb_art_craft_menu(call: CallbackQuery):
+    # 🧿 Создание: выбор статы артефакта (редкость и имя — случайные)
+    if not await _art_ok(call):
+        return
+    fl = await db_get_flags(call.from_user.id)
+    shards = fl.get("shards") or 0
+    rows = [[ib(f"{ART_STAT_ICON[s]} {ART_SLOTS[s]} — база +{ART_BASE[s]}",
+                f"artcraft:{s}")] for s in ART_BASE]
+    rows.append([ib("⬅️ Назад", "art:0")])
+    await safe_answer(call)
+    await safe_edit(call, f"🧿 <b>Создание артефакта</b> · стоимость: {ART_CRAFT_COST}💎 "
+                          f"(у вас 💎{shards})\n\nРедкость будет случайной — она "
+                          "добавляет +0…+4 к бонусу. Выберите стату:",
+                    InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("artcraft:"))
+async def cb_art_craft_do(call: CallbackQuery):
+    if not await _art_ok(call):
+        return
+    stat = call.data.split(":")[1]
+    uid = call.from_user.id
+    if stat not in ART_BASE:
+        await safe_answer(call, "Неизвестная стата.", show_alert=True)
+        return
+    fl = await db_get_flags(uid)
+    shards = fl.get("shards") or 0
+    if shards < ART_CRAFT_COST:
+        await safe_answer(call, f"Недостаточно осколков: нужно {ART_CRAFT_COST}💎, "
+                                f"у вас {shards}💎. Добудьте в миссии (⛏).",
+                          show_alert=True)
+        return
+    await db_add_shards(uid, -ART_CRAFT_COST)
+    d = {"name": random.choice(ART_NAMES[stat]), "stat": stat,
+         "rarity": roll_rarity(), "level": 1}
+    aid = await db_add_artifact(uid, d)
+    row = await db_get_artifact(aid, uid)
+    await safe_answer(call, "🧿 Артефакт создан!")
+    if row is None:
+        text, markup = await artifacts_screen(uid, 0)
+        await safe_edit(call, text, markup)
+        return
+    await safe_edit(call, "🧿 <b>Артефакт создан!</b>\n\n" + artifact_line(row) +
+                    "\n\nНаденьте его на карту — бонус действует в бою.",
+                    kb([ib("🃏 Надеть на карту…", f"arte:{aid}:0")],
+                       [ib("⬆️ Улучшить", f"artu:{aid}:0"), ib("🗡 Артефакты", "art:0")]))
+
+
+@router.callback_query(F.data.startswith("arta:"))
+async def cb_artifact_details(call: CallbackQuery):
+    # Карточка артефакта: бонус, уровень, надетая карта, действия
+    if not await _art_ok(call):
+        return
+    parts = call.data.split(":")
+    aid, page = int(parts[1]), parts[2] if len(parts) > 2 else "0"
+    uid = call.from_user.id
+    row = await db_get_artifact(aid, uid)
+    if not row:
+        await safe_answer(call, "Артефакт не найден.", show_alert=True)
+        return
+    cards = await db_user_cards(uid)
+    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
+    lvl = max(1, int(row.get("level") or 1))
+    rank = rarity_rank(row.get("rarity") or "common")
+    bonus = art_bonus_of(row)
+    cid = row.get("equipped_card") or 0
+    eq_c = next((c for c in cards if c["id"] == cid), None) if cid else None
+    eq = f"🃏 Надет на: <b>{disp_name(eq_c)}</b>" if eq_c else "🃏 Не надет"
+    up_line = (f"⬆️ Следующий уровень: {art_up_cost(lvl)}💎 → +{ART_PER_LVL[stat]} к бонусу"
+               if lvl < ART_MAX_LEVEL else "⭐ Максимальный уровень")
+    text = (f"🗡 <b>{row['name']}</b> · #{row['id']}\n"
+            f"{rarity_label(row.get('rarity') or 'common')} · {ART_SLOTS.get(stat, stat)}\n\n"
+            f"{ART_STAT_ICON[stat]} Бонус в бою: <b>+{bonus}</b> "
+            f"(база {ART_BASE[stat]} + редкость {rank} + уровни {(lvl - 1) * ART_PER_LVL[stat]})\n"
+            f"⭐ Уровень: {lvl}/{ART_MAX_LEVEL} · {up_line}\n{eq}\n\n"
+            "<i>Бонус действует только в бою и не меняется в самой карте — "
+            "снять артефакт можно в любой момент.</i>")
+    rows = []
+    if lvl < ART_MAX_LEVEL:
+        rows.append([ib(f"⬆️ Улучшить ({art_up_cost(lvl)}💎)", f"artu:{aid}:{page}")])
+    rows.append([ib("🃏 Надеть на карту…" if not eq_c else "🃏 Надеть на другую…",
+                    f"arte:{aid}:{page}")])
+    if eq_c:
+        rows.append([ib("♻️ Снять", f"artoff:{aid}:{page}")])
+    rows.append([ib("⬅️ К списку", f"art:{page}")])
+    await safe_answer(call)
+    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("artu:"))
+async def cb_artifact_upgrade(call: CallbackQuery):
+    # ⬆️ Улучшение за осколки: цена = ART_UP_COST_STEP × уровень
+    if not await _art_ok(call):
+        return
+    parts = call.data.split(":")
+    aid, page = int(parts[1]), parts[2] if len(parts) > 2 else "0"
+    uid = call.from_user.id
+    row = await db_get_artifact(aid, uid)
+    if not row:
+        await safe_answer(call, "Артефакт не найден.", show_alert=True)
+        return
+    lvl = max(1, int(row.get("level") or 1))
+    if lvl >= ART_MAX_LEVEL:
+        await safe_answer(call, f"Уже максимальный уровень ({ART_MAX_LEVEL}).",
+                          show_alert=True)
+        return
+    cost = art_up_cost(lvl)
+    fl = await db_get_flags(uid)
+    if (fl.get("shards") or 0) < cost:
+        await safe_answer(call, f"Нужно {cost}💎, у вас {fl.get('shards') or 0}💎. "
+                                "Добудьте в миссии (⛏).", show_alert=True)
+        return
+    await db_add_shards(uid, -cost)
+    await db_patch_artifact(aid, uid, {"level": lvl + 1})
+    row = await db_get_artifact(aid, uid)
+    await safe_answer(call, f"⬆️ Уровень {lvl + 1}!")
+    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
+    await safe_edit(call, f"⬆️ <b>{row['name']}</b> улучшен до L{lvl + 1} — "
+                          f"бонус теперь {ART_STAT_ICON[stat]}+{art_bonus_of(row)}.\n"
+                          f"💎 Осколков: {(fl.get('shards') or 0) - cost}",
+                    kb([ib("⬆️ Улучшить ещё", f"artu:{aid}:{page}")
+                        if lvl + 1 < ART_MAX_LEVEL else ib("⭐ Макс. уровень", f"arta:{aid}:{page}")],
+                       [ib("🗡 К артефакту", f"arta:{aid}:{page}"), ib("🗡 Список", f"art:{page}")]))
+
+
+@router.callback_query(F.data.startswith("arte:"))
+async def cb_artifact_equip_list(call: CallbackQuery):
+    # 🃏 Надеть: список карт коллекции (пагинация), клик — надеть
+    if not await _art_ok(call):
+        return
+    parts = call.data.split(":")
+    aid = int(parts[1])
+    uid = call.from_user.id
+    row = await db_get_artifact(aid, uid)
+    if not row:
+        await safe_answer(call, "Артефакт не найден.", show_alert=True)
+        return
+    cards = await db_user_cards(uid)
+    if not cards:
+        await safe_answer(call, "Нет карт — не на что надеть.", show_alert=True)
+        return
+    page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    n_pages = max(1, (len(cards) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+    page = max(0, min(page, n_pages - 1))
+    cur = row.get("equipped_card") or 0
+    rows = []
+    lines = [f"🃏 <b>Надеть «{row['name']}»</b> — выберите карту "
+             f"(сейчас: {'⬇️ ниже' if cur else 'не надет'}):"]
+    for c in cards[page * CARDS_PER_PAGE:(page + 1) * CARDS_PER_PAGE]:
+        mark = "✅ " if c["id"] == cur else ""
+        lines.append(f"{mark}{card_full_line(c)}")
+        rows.append([ib(f"{mark}{card_line(c)}"[:64], f"arteq:{aid}:{c['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(ib("◀️", f"arte:{aid}:{page - 1}"))
+    nav.append(ib("⬅️ К артефакту", f"arta:{aid}:0"))
+    if page < n_pages - 1:
+        nav.append(ib("▶️", f"arte:{aid}:{page + 1}"))
+    rows.append(nav)
+    await safe_answer(call)
+    await safe_edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("arteq:"))
+async def cb_artifact_equip(call: CallbackQuery):
+    if not await _art_ok(call):
+        return
+    _, aid, cid, page = call.data.split(":")
+    uid = call.from_user.id
+    row = await db_get_artifact(int(aid), uid)
+    card = await db_get_card(int(cid), uid)
+    if not row or not card:
+        await safe_answer(call, "Артефакт или карта не найдены.", show_alert=True)
+        return
+    # На карте может быть только ОДИН артефакт — освобождаем слот
+    await db_unequip_card(uid, int(cid))
+    await db_patch_artifact(int(aid), uid, {"equipped_card": int(cid)})
+    row = await db_get_artifact(int(aid), uid)
+    await safe_answer(call, "🃏 Артефакт надет!")
+    await safe_edit(call, f"🗡 <b>{row['name']}</b> надет на {disp_name(card)} — "
+                          f"бонус действует в следующем бою (в текущем активном бою "
+                          "состав уже зафиксирован).\n\n" + card_text(card),
+                    kb([ib("🗡 Артефакты", f"art:{page}")], [ib("🏠 Меню", "mn:home")]))
+
+
+@router.callback_query(F.data.startswith("artoff:"))
+async def cb_artifact_unequip(call: CallbackQuery):
+    if not await _art_ok(call):
+        return
+    parts = call.data.split(":")
+    aid, page = int(parts[1]), parts[2] if len(parts) > 2 else "0"
+    uid = call.from_user.id
+    row = await db_get_artifact(aid, uid)
+    if not row:
+        await safe_answer(call, "Артефакт не найден.", show_alert=True)
+        return
+    await db_patch_artifact(aid, uid, {"equipped_card": 0})
+    row = await db_get_artifact(aid, uid)
+    await safe_answer(call, "♻️ Артефакт снят")
+    await safe_edit(call, f"♻️ <b>{row['name']}</b> снят — статы карты снова базовые.",
+                    kb([ib("🗡 К артефакту", f"arta:{aid}:{page}")],
+                       [ib("🗡 Список", f"art:{page}")]))
+
+
+# ---------- ⛏ миссии по добыче осколков ----------
+
+async def missions_screen(user_id: int):
+    # ⛏ Выбор миссии: сложность = редкость и уровень противника,
+    # награда — осколки за ПОБЕДУ. Кулдаун MISSION_COOLDOWN_MIN — свой.
+    fl = await db_get_flags(user_id)
+    left = cooldown_left(await db_get_stamp(user_id, "last_mission_at"),
+                         MISSION_COOLDOWN_MIN) if MISSION_COOLDOWN_MIN > 0 else 0
+    if await db_load_battle(user_id):
+        cd_line = "⚔️ Сначала завершите текущий бой/миссию."
+    elif left > 0:
+        cd_line = f"⏳ Следующая миссия — через <b>{fmt_left(left)}</b>."
+    else:
+        cd_line = "✅ Отряд готов к вылазке."
+    lines = ["⛏ <b>Миссия по добыче осколков</b>",
+             f"💎 Осколков: {fl.get('shards') or 0} · {cd_line}",
+             "",
+             "Отряд (ваша ⭐приоритетная колода, иначе первая непустая) уходит "
+             "на вылазку: это обычный бой с ботом, но противник сильнее. "
+             "Осколки — только за ПОБЕДУ:"]
+    rows = []
+    for m in MISSIONS:
+        rows.append([ib(f"{m['label']} — враг {rarity_label(m['rar'])}"
+                        + (f", +{m['dlvl']} ур." if m["dlvl"] else "")
+                        + f" · 💎{m['shards']}", f"artmr:{m['key']}")])
+    rows.append([ib("⬅️ Назад", "art:0")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "artm")
+async def cb_missions(call: CallbackQuery):
+    if not await _art_ok(call):
+        return
+    text, markup = await missions_screen(call.from_user.id)
+    await safe_answer(call)
+    await safe_edit(call, text, markup)
+
+
+@router.callback_query(F.data.startswith("artmr:"))
+async def cb_mission_run(call: CallbackQuery):
+    # Старт миссии: обычный бой, но с меткой state["mission"] — по победе
+    # end_battle начислит осколки. Колода — ⭐приоритетная, иначе первая
+    # непустая (как в админ-прогоне).
+    if not await _art_ok(call):
+        return
+    key = call.data.split(":")[1]
+    m = next((x for x in MISSIONS if x["key"] == key), None)
+    uid = call.from_user.id
+    if m is None:
+        await safe_answer(call, "Неизвестная миссия.", show_alert=True)
+        return
+    if await db_load_battle(uid):
+        await safe_answer(call, "У вас уже идёт бой — сначала завершите его.",
+                          show_alert=True)
+        return
+    if MISSION_COOLDOWN_MIN > 0:
+        left = cooldown_left(await db_get_stamp(uid, "last_mission_at"),
+                             MISSION_COOLDOWN_MIN)
+        if left > 0:
+            await safe_answer(call, f"⏳ Миссия доступна через {fmt_left(left)}.",
+                              show_alert=True)
+            return
+    all_cards = await db_user_cards(uid)
+    decks = decks_of(all_cards)
+    pref = await user_flag(uid, "pref_deck")
+    deck = pref if decks.get(pref) else next((d for d in sorted(decks) if decks[d]), 0)
+    cards = decks.get(deck, [])[:MAX_DECK] if deck else []
+    if not cards:
+        await safe_answer(call, "Все колоды пусты — соберите колоду (🃏 Колода).",
+                          show_alert=True)
+        return
+    artifacts = await equipped_artifact_bonuses(uid)
+    avg_level = max(1, round(sum(c["level"] for c in cards) / len(cards)))
+    state = create_battle(cards, random.choice(list(LAYOUTS)),
+                          enemy_rarity=m["rar"], enemy_level=avg_level + m["dlvl"],
+                          artifacts=artifacts)
+    state["mission"] = {"key": m["key"], "label": m["label"], "shards": m["shards"]}
+    log_add(state, f"⛏ Миссия «{m['label']}» началась! Победа принесёт "
+                   f"💎{m['shards']} осколков. Удачи!")
+    await db_save_battle(uid, state)
+    if MISSION_COOLDOWN_MIN > 0:
+        await db_stamp(uid, "last_mission_at")   # кулдаун — от старта вылазки
+    await safe_answer(call, "⛏ Отряд ушёл на вылазку!")
+    await safe_edit(call, battle_text(state), kb_battle(state))
+
+
+# =====================================================================
 # АДМИН-ПАНЕЛЬ (/admin + пароль ADMIN_PASSWORD)
 # Возможности (по заданию): получить карту (любой редкости), прокачать,
 # сменить редкость, удалить, вылечить все карты и ПРОГОН БОЁВ:
@@ -5408,7 +6638,9 @@ def admin_text() -> str:
             "🗑 Удалить карту\n"
             "❤️ Вылечить все карты\n"
             f"⚔️ Прогон боёв — N боёв (N &lt; 50) вашей колодой против колоды "
-            f"аналогичной редкости; полный лог ходов придёт файлом.")
+            f"аналогичной редкости; полный лог ходов придёт файлом.\n"
+            "🧪 Фичи — экспериментальные разделы (🗡 Артефакты, 🌀 Арканы): "
+            "включаются только здесь и ИНДИВИДУАЛЬНО каждому игроку.")
 
 
 def admin_kb() -> InlineKeyboardMarkup:
@@ -5417,8 +6649,33 @@ def admin_kb() -> InlineKeyboardMarkup:
         [ib("✨ Редкость", "adm:rar:0"), ib("🗑 Удалить", "adm:del:0")],
         [ib("❤️ Вылечить все карты", "adm:heal")],
         [ib("⚔️ Прогон боёв", "adm:sim")],
+        [ib("🧪 Фичи (Артефакты/Арканы)", "adm:feat")],
         [ib("🏠 Меню", "mn:home")],
     )
+
+
+# ---------- 🧪 экспериментальные фичи: индивидуальное включение ----------
+
+FEAT_COLS = {"art": ("feat_artifacts", "🗡 Артефакты и миссии"),
+             "arc": ("feat_arcana", "🌀 Аркановые персонажи")}
+
+
+async def feat_screen(target_uid: int):
+    # Экран флагов игрока target_uid: что включено + тумблеры
+    fl = await db_get_flags(target_uid)
+    lines = [f"🧪 <b>Экспериментальные фичи</b> · игрок <code>{target_uid}</code>", ""]
+    rows = []
+    for key, (col, label) in FEAT_COLS.items():
+        on = bool(fl.get(col))
+        lines.append(f"{label}: {'✅ ВКЛЮЧЕНО' if on else '❌ выключено'}")
+        rows.append([ib(f"{'🚫 Выключить' if on else '✅ Включить'} — {label}",
+                        f"admf:{target_uid}:{key}")])
+    lines += ["", "🗡 Артефакты: у игрока в «👤 Профиль» появляется раздел "
+                 "артефактов и миссии по добыче 💎.",
+              "🌀 Арканы: новые карты игрока с шансом ARCANA_CHANCE_PCT% "
+              "становятся аркановыми (связки на поле дают ауры)."]
+    rows.append([ib("⬅️ Админ-панель", "adm:root")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def admin_card_list(call: CallbackQuery, op: str, page: int):
@@ -5464,6 +6721,11 @@ async def run_battle_sims(user_id: int, n: int):
     bcards = await db_battle_cards(user_id, deck)
     if not bcards:
         return None, None
+    # 🗡 Если игроку включены артефакты — прогон учитывает надетые
+    # (симуляция должна совпадать с реальным боем).
+    artifacts = None
+    if await user_flag(user_id, "feat_artifacts"):
+        artifacts = await equipped_artifact_bonuses(user_id)
     n = max(1, min(n, SIM_MAX_BATTLES))
     ranks = [rarity_rank(c["rarity"] if "rarity" in c.keys() else "common") for c in bcards]
     enemy_rarity = RARITY_KEYS[max(0, min(4, round(sum(ranks) / len(ranks))))]
@@ -5482,7 +6744,8 @@ async def run_battle_sims(user_id: int, n: int):
     ]
     for i in range(n):
         state = create_battle([dict(c) for c in bcards],
-                              random.choice(list(LAYOUTS)), enemy_rarity=enemy_rarity)
+                              random.choice(list(LAYOUTS)), enemy_rarity=enemy_rarity,
+                              artifacts=artifacts)
         state["no_trim"] = True  # полный журнал без обрезки
         seen = 0
         battle_log = [f"=== БОЙ {i + 1}/{n} ==="]
@@ -5627,6 +6890,39 @@ async def cb_admin(call: CallbackQuery, bot: Bot):
                 await safe_edit(call, admin_text(), admin_kb())
             return
 
+    if op == "feat":
+        # 🧪 Экспериментальные фичи — индивидуальное включение игрокам.
+        # adm:feat — выбор: себе или по ID; adm:feat:u:{uid} — экран флагов.
+        if len(parts) == 2:
+            rows = [[ib("🧪 Включить/выключить СЕБЕ", f"adm:feat:u:{uid}")],
+                    [ib("👤 Другому игроку (по ID)", "adm:feat:ask")],
+                    [ib("⬅️ Назад", "adm:root")]]
+            await safe_answer(call)
+            await safe_edit(call, "🧪 <b>Экспериментальные фичи</b>\n\n"
+                                   "🗡 Артефакты и 🌀 Арканы выключены у всех по "
+                                   "умолчанию и включаются ИНДИВИДУАЛЬНО: себе — "
+                                   "сразу, другому игроку — по его Telegram ID "
+                                   "(числовой; узнать: «👤 Профиль» игрока не "
+                                   "показывает ID — спросите у самого игрока или "
+                                   "посмотрите в таблице users).",
+                            InlineKeyboardMarkup(inline_keyboard=rows))
+            return
+        if parts[2] == "ask":
+            await set_user_flag(uid, "awaiting_feat", 1)
+            await safe_answer(call)
+            await safe_edit(call, "👤 Отправьте <b>числовой Telegram ID</b> игрока "
+                                  "обычным сообщением — откроется экран его фич.\n"
+                                  "Для отмены — /cancel.",
+                            kb([ib("⬅️ Отменить", "adm:feat")]))
+            return
+        if parts[2] == "u":
+            target = int(parts[3])
+            await ensure_user_row(target)   # игрок может ещё не писать боту
+            text, markup = await feat_screen(target)
+            await safe_answer(call)
+            await safe_edit(call, text, markup)
+            return
+
     if op == "sim":
         if len(parts) == 2:
             ns = sorted({5, 10, 25, SIM_MAX_BATTLES})
@@ -5762,6 +7058,27 @@ async def cb_admin_lvl_finish(call: CallbackQuery):
         await safe_edit(call, "Карта не найдена.", kb([ib("🛠 Панель", "adm:root")]))
         return
     await _admin_lvl_final(call, row, "⏹ <b>Распределение завершено досрочно.</b>\n\n")
+
+
+@router.callback_query(F.data.startswith("admf:"))
+async def cb_admin_feat_toggle(call: CallbackQuery):
+    # 🧪 Тумблер фичи: admf:{target_uid}:{art|arc} — включить/выключить
+    # раздел выбранному игроку (индивидуально, по заказу).
+    if not await _admin_ok(call):
+        return
+    parts = call.data.split(":")
+    target, key = int(parts[1]), parts[2]
+    if key not in FEAT_COLS:
+        await safe_answer(call, "Неизвестная фича.", show_alert=True)
+        return
+    col, label = FEAT_COLS[key]
+    await ensure_user_row(target)
+    cur = await user_flag(target, col)
+    await set_user_flag(target, col, 0 if cur else 1)
+    await safe_answer(call, f"{label}: {'выключено' if cur else 'включено'} "
+                            f"игроку {target}")
+    text, markup = await feat_screen(target)
+    await safe_edit(call, text, markup)
 
 
 # =====================================================================
