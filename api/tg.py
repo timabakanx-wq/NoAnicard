@@ -1,3 +1,46 @@
+# Точка входа Vercel Serverless Function: Telegram webhook → aiogram.
+#
+# Деплой (из папки vercel/):  vercel deploy --prod
+# (или в настройках проекта Vercel: Root Directory = vercel)
+# Затем один раз зарегистрировать webhook (проще всего — скриптом):
+#   python3 webhook_tool.py set --url https://<ваш-проект>.vercel.app/tg
+# или вручную:
+#   https://api.telegram.org/bot<TOKEN>/setWebhook
+#       ?url=https://<ваш-проект>.vercel.app/tg
+#       &secret_token=<WEBHOOK_SECRET>
+#       &allowed_updates=["message","callback_query"]
+#
+# ---------------------------------------------------------------------
+# САМОДИАГНОСТИКА (главное для отладки «бот молчит»):
+#   GET https://<проект>.vercel.app/            — статус: env, версии, счётчики
+#   GET https://<проект>.vercel.app/diag?key=<WEBHOOK_SECRET>
+#       — полный отчёт: getMe, getWebhookInfo (адрес webhook, сколько
+#         обновлений зависло, последняя ошибка Telegram), проверка каждой
+#         таблицы Supabase, журнал последних запросов и ошибок,
+#         сквозной «probe» /start через весь код бота.
+#   Можно и так: /?diag=<WEBHOOK_SECRET>&probe=1
+# ---------------------------------------------------------------------
+#
+# Особенности serverless (учтены в коде):
+#  - Dispatcher создаётся один раз на контейнер, а Bot + aiohttp-сессии —
+#    НА КАЖДЫЙ ЗАПРОС и закрываются до отправки ответа. Причина: контейнер
+#    Lambda между запросами «замораживается», TCP-соединения в пуле умирают,
+#    и переиспользование старой сессии даёт молчаливые обрывы
+#    (ServerDisconnectedError) — внешне это выглядит как «бот не отвечает»;
+#  - весь ответ Telegram отправляется ДО возврата 200 (иначе заморозка
+#    контейнера обрывает запрос);
+#  - ошибки хендлеров НЕ тонут: пишутся в журнал, в логи, пользователю
+#    уходит сообщение с причиной, а Telegram получает 500 (и повторит);
+#  - секрет webhook проверяется по заголовку X-Telegram-Bot-Api-Secret-Token
+#    (страховка: если секрет «приехал» в пути — тоже принимаем, но пишем
+#    предупреждение в журнал);
+#  - состояние «ждём пароль» хранится в БД (users.awaiting_password),
+#    поэтому MemoryStorage/FSM не нужны — запросы могут попадать на
+#    разные контейнеры;
+#  - ЗАЩИТА ОТ ОШИБКИ СБОРКИ: если платформа не установила зависимости
+#    (requirements.txt не найден билдером), импорт повторяется из
+#    вендора api/_vendor/ (см. vendor_deps.py); если и это не удалось —
+#    функция отдаёт JSON-диагностику вместо немых 500.
 from __future__ import annotations
 
 import asyncio
@@ -397,7 +440,7 @@ async def _collect_diagnostics(probe: bool = False) -> dict:
     try:
         await bot_app.db_init()
         try:
-            for table in ("users", "cards", "battles", "sim_logs"):
+            for table in ("users", "cards", "battles", "sim_logs", "artifacts"):
                 try:
                     rows = await bot_app._rest("GET", table,
                                                params={"select": "*", "limit": "1"})
@@ -631,3 +674,4 @@ async def _notify_user_error_wrap(chat_id: int, text: str) -> str:
         return await _notify_user_error(bot, chat_id, text)
     finally:
         await bot.session.close()
+м
