@@ -73,7 +73,7 @@ SIM_MAX_BATTLES = 49
 BATTLE_TIMEOUT_MIN = int(os.environ.get("BATTLE_TIMEOUT_MIN", "0") or 0)
 CARD_TIMEOUT_MIN = int(os.environ.get("CARD_TIMEOUT_MIN", "0") or 0)
 # Кулдаун миссий по добыче ресурсов (часть фичи «Артефакты», см. ниже).
-MISSION_COOLDOWN_MIN = int(os.environ.get("MISSION_COOLDOWN_MIN", "30") or 0)
+MISSION_COOLDOWN_MIN = int(os.environ.get("MISSION_COOLDOWN_MIN", "0") or 0)
 
 # DB_PATH не используется: БД — Supabase (SUPABASE_URL/SUPABASE_KEY)
 
