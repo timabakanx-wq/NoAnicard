@@ -73,7 +73,25 @@ SIM_MAX_BATTLES = 49
 BATTLE_TIMEOUT_MIN = int(os.environ.get("BATTLE_TIMEOUT_MIN", "0") or 0)
 CARD_TIMEOUT_MIN = int(os.environ.get("CARD_TIMEOUT_MIN", "0") or 0)
 # Кулдаун миссий по добыче ресурсов (часть фичи «Артефакты», см. ниже).
-MISSION_COOLDOWN_MIN = int(os.environ.get("MISSION_COOLDOWN_MIN", "0") or 0)
+MISSION_COOLDOWN_MIN = int(os.environ.get("MISSION_COOLDOWN_MIN", "30") or 0)
+
+# =====================================================================
+# ⚖️ ПОДБОР ПРОТИВНИКА ПО СИЛЕ ОТРЯДА (правка заказчика)
+# =====================================================================
+# Рейтинг отряда — просто СУММА ВСЕХ СТАТ колоды (отдельно ⚔ атака,
+# 🛡 защита, ❤ хиты, 🥷 скрытность/🎯 точность; бонусы надетых артефактов
+# входят в сумму). Противник в обычном бою подбирается так: случайные
+# карты ТОЙ ЖЕ средней редкости, что и колода игрока (в том же
+# количестве), генерируются повторно, пока СУММАРНАЯ МОДЕЛЬ РАЗНИЦЫ всех
+# стат не станет ≤ ENEMY_MATCH_DIFF_MAX:
+#     модель = |Δ⚔| + |Δ🛡| + |Δ❤|×0.5 + |Δ🥷|
+# (хиты взвешены ×0.5 — 2 HP ≈ 1 очко атаки/защиты, как в весах
+# артефактов ART_STAT_WEIGHT). Если за ENEMY_MATCH_TRIES попыток не
+# сошлось — берётся лучший (минимальный) результат.
+# В миссиях и админ-прогоне подбор НЕ работает — там фиксированная
+# сложность (редкость/уровень задаются явно).
+ENEMY_MATCH_DIFF_MAX = 5     # модель разницы ≤ 5 — противник «равный»
+ENEMY_MATCH_TRIES = 400      # потолок генераций (чистый Python, ~50 мс)
 
 # DB_PATH не используется: БД — Supabase (SUPABASE_URL/SUPABASE_KEY)
 
@@ -153,6 +171,13 @@ RARITY_INFO = {
     # генерация = перебор ЭПИЧЕСКИХ карт (mult 115), пока выбранная стата
     # не победит в своей паре. Либо выдаётся админом вручную.
     "heroic":    {"label": "🟧 Героическая", "mult": 115, "weight": 0,  "rank": 5},
+    # 🔴 АРКАНОВАЯ (правка заказчика): аркана — ЭТО РЕДКОСТЬ, обозначается
+    # красным; бонусы статов — КАК У ЛЕГЕНДАРНОЙ (mult 120). weight=0:
+    # выпадает только при включённой фиче feat_arcana (шанс ARCANA_CHANCE_PCT
+    # при получении карты) или выдаётся админом. Каждая аркановая карта
+    # дополнительно принадлежит одному из сетов (cards.arcana: 🔥 Пламя /
+    # 🪨 Камень / 🌿 Жизнь) — связки на поле дают ауры (см. ARCANA_SETS).
+    "arcana":    {"label": "🔴 Аркановая",  "mult": 120, "weight": 0,  "rank": 6},
 }
 RARITY_KEYS = list(RARITY_INFO.keys())
 
@@ -194,14 +219,17 @@ HERO_STAT_LABEL = {"attack": "⚔️ Атака", "armor": "🛡 Защита",
 HERO_REROLL_LIMIT = 500   # потолок перебора эпических персонажей (страховка)
 
 # =====================================================================
-# 🌀 АРКАНОВЫЕ ПЕРСОНАЖИ (экспериментальная фича — включается только
+# 🔴 АРКАНОВЫЕ ПЕРСОНАЖИ (экспериментальная фича — включается только
 # в админ-панели, индивидуально каждому игроку: users.feat_arcana)
 # =====================================================================
-# Аркановая карта принадлежит одному из сетов. Когда на ПОЛЕ БОЯ
-# одновременно стоит нужное число (need) карт одного сета — каждая из
-# них получает постоянную ауру-бафф (снятие ауры — когда сет распался,
-# например союзник погиб). Шанс того, что НОВАЯ полученная карта
-# окажется аркановой (только при включённой фиче) — ARCANA_CHANCE_PCT.
+# АРКАНА — ЭТО РЕДКОСТЬ (правка заказчика): обозначается красным 🔴,
+# бонусы статов — КАК У ЛЕГЕНДАРНОЙ карты (mult 120, см. RARITY_INFO).
+# Каждая аркановая карта дополнительно принадлежит одному из СЕТОВ
+# (cards.arcana). Когда на ПОЛЕ БОЯ одновременно стоит нужное число
+# (need) карт одного сета — каждая получает постоянную ауру-бафф
+# (снятие ауры — когда связка распалась, например союзник погиб).
+# Шанс, что НОВАЯ карта окажется аркановой (только при включённой
+# фиче) — ARCANA_CHANCE_PCT («очень редкие» — реже легендарной).
 ARCANA_SETS = {
     "flame": {"name": "Пламя",    "emoji": "🔥", "need": 2, "fx": "arc_atk",
               "val": 2, "desc": "2+ карт сета на поле: +2 к Атаке каждой."},
@@ -220,15 +248,42 @@ ARCANA_CHANCE_PCT = int(os.environ.get("ARCANA_CHANCE_PCT", "2") or 0)  # «пи
 # на вылазку, проводится бой с ботом, за ПОБЕДУ начисляются осколки.
 # Артефакт надевается на карту (1 артефакт на карту, 1 карта у артефакта)
 # и добавляет статы в бою; качается ОТДЕЛЬНО от карты за осколки.
-# Бонус = ART_BASE[стата] + ранг редкости + (уровень−1)×ART_PER_LVL[стата].
 # ВАЖНО: бонусы действуют только в бою и НЕ въедаются в БД карты —
 # при записи итогов боя они вычитаются обратно (см. art_bonus).
+#
+# БАЛАНС (правка заказчика): прокачка до L10 РАСТЯНУТА от начального
+# бонуса до максимума своей редкости — у каждой редкости свой КАП СИЛЫ
+# (в поинтах), у легендарной и героической он максимальный:
+#   ⬜10 · 🟩15 · 🟦20 · 🟪25 · 🟨30 · 🟧30 · 🥇30
+# Текущий бонус = cap × ART_POWER_LEVELS[level-1] (кривая 0.33→1.00),
+# округление ВНИЗ. В ПОИНТАХ статы весят по-разному (ART_STAT_WEIGHT):
+# защита дороже атаки (каждое КЗ = −10% входящего урона), HP дешевле.
+# Лимит суммарной силы отряда — переменная ART_DECK_POWER_LIMIT (0 = без
+# лимита): надеть артефакты сверх бюджета нельзя.
 # =====================================================================
 ART_SLOTS = {"attack": "⚔️ Оружие", "armor": "🛡 Доспех",
              "hp": "❤️ Амулет жизни", "sub": "🥷 Клык тени"}
-ART_BASE = {"attack": 2, "armor": 2, "hp": 5, "sub": 1}     # бонус 1-го уровня
-ART_PER_LVL = {"attack": 1, "armor": 1, "hp": 2, "sub": 1}  # рост за уровень
-ART_MAX_LEVEL = 10
+
+# КАП СИЛЫ артефакта (поинты на L10) — по редкости. Легендарная (и выше) —
+# максимальная сила; более редкие = более «ёмкий» артефакт, но кривая та же.
+ART_POWER_CAP = {
+    "common": 10, "uncommon": 15, "rare": 20,
+    "epic": 25, "legendary": 30, "heroic": 30, "arcana": 30,
+}
+# Кривая прокачки L1→L10: доля капа редкости на каждом уровне. Растяжка
+# от начального бонуса (L1 = cap×0.33) до максимума (L10 = cap×1.00).
+ART_POWER_LEVELS = (0.33, 0.40, 0.48, 0.55, 0.63, 0.70, 0.78, 0.85, 0.93, 1.00)
+# Вес статы в ПОИНТАХ силы: 1 поинт = 1 ⚔️ = 2 ❤ = 0.6 🛡 = 0.8 🥷
+# (защита в ~1.8 раза ценнее атаки, скрытность — в ~1.3 раза).
+ART_STAT_WEIGHT = {"attack": 1.0, "armor": 1.8, "hp": 0.5, "sub": 1.3}
+# Начальный бонус L1 — не меньше ART_MIN_BONUS (чтобы ⬜ артефакт был полезен)
+ART_MIN_BONUS = 1
+# ЛИМИТ СИЛЫ ОТРЯДА (поинты): суммарная сила надетых артефактов карт,
+# идущих в бой. 0 = лимит выключен. Контролируется при надевании
+# (экипировка сверх бюджета запрещена).
+ART_DECK_POWER_LIMIT = int(os.environ.get("ART_DECK_POWER_LIMIT", "70") or 0)
+
+ART_MAX_LEVEL = len(ART_POWER_LEVELS)     # = 10
 ART_CRAFT_COST = 30          # 💎 за создание артефакта (стата — на выбор)
 ART_UP_COST_STEP = 10        # 💎 улучшение: ART_UP_COST_STEP × текущий уровень
 ART_NAMES = {
@@ -256,11 +311,25 @@ def art_up_cost(level: int) -> int:
 
 
 def art_bonus_of(row) -> int:
-    # Текущий бонус артефакта к его стате
-    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
-    rank = rarity_rank(row.get("rarity") or "common")
-    lvl = max(1, int(row.get("level") or 1))
-    return ART_BASE[stat] + rank + (lvl - 1) * ART_PER_LVL[stat]
+    # Текущий бонус артефакта к его стате (в единицах статы).
+    # БАЛАНС: сила = кап редкости (в ПОИНТАХ) × кривая уровня, округление
+    # вниз; перевод поинтов в единицы статы — ДЕЛЕНИЕМ на вес статы
+    # (🛡 защита «дорогая»: 30 п. = +16 КЗ; ❤ HP «дешёвое»: 30 п. = +60 HP;
+    # 1 поинт = 1 ⚔ = 0.56 🛡 = 2 ❤ = 0.77 🥷). Минимум ART_MIN_BONUS —
+    # даже ⬜ артефакт 1-го уровня что-то даёт.
+    stat = row["stat"] if row.get("stat") in ART_STAT_WEIGHT else "attack"
+    cap = ART_POWER_CAP.get(row.get("rarity") or "common", 10)
+    lvl = max(1, min(int(row.get("level") or 1), ART_MAX_LEVEL))
+    power = cap * ART_POWER_LEVELS[lvl - 1]          # поинты силы
+    w = ART_STAT_WEIGHT.get(stat, 1.0)
+    return max(ART_MIN_BONUS, int(power / w + 1e-9))
+
+
+def artifact_power(row) -> float:
+    # Сила артефакта В ПОИНТАХ (валюта баланса): бонус × вес статы.
+    # Используется для лимита силы отряда (ART_DECK_POWER_LIMIT).
+    stat = row["stat"] if row.get("stat") in ART_STAT_WEIGHT else "attack"
+    return art_bonus_of(row) * ART_STAT_WEIGHT.get(stat, 1.0)
 
 
 # =====================================================================
@@ -1096,9 +1165,37 @@ async def equipped_artifact_bonuses(user_id: int) -> dict:
     out = {}
     for a in await db_user_artifacts(user_id):
         cid = a.get("equipped_card") or 0
-        if cid and a.get("stat") in ART_BASE:
+        if cid and a.get("stat") in ART_STAT_WEIGHT:
             out.setdefault(int(cid), {})[a["stat"]] = art_bonus_of(a)
     return out
+
+
+def bonuses_power(ab: dict) -> float:
+    # Сила набора бонусов {stat: value} в ПОИНТАХ
+    return sum(v * ART_STAT_WEIGHT.get(k, 1.0) for k, v in (ab or {}).items())
+
+
+def apply_artifact_budget(cards, artifacts: dict):
+    # ЛИМИТ СИЛЫ ОТРЯДА (ART_DECK_POWER_LIMIT, поинты; 0 = выключен):
+    # в бой берутся артефакты карт (в порядке id), пока суммарная сила
+    # не исчерпана; излишки НЕ действуют. Возвращает (взятые, список
+    # пропущенных card_id). Гарантия: даже если экипировка собиралась
+    # в обход проверки (карту добавили в колоду позже), бой не превысит бюджет.
+    if not artifacts or ART_DECK_POWER_LIMIT <= 0:
+        return artifacts or {}, []
+    total = 0.0
+    taken, skipped = {}, []
+    for c in sorted(cards, key=lambda x: x["id"]):
+        ab = artifacts.get(c["id"])
+        if not ab:
+            continue
+        p = bonuses_power(ab)
+        if total + p <= ART_DECK_POWER_LIMIT + 1e-9:
+            taken[c["id"]] = ab
+            total += p
+        else:
+            skipped.append(c["id"])
+    return taken, skipped
 
 
 # =====================================================================
@@ -1375,14 +1472,61 @@ def make_unit(d: dict, side: str, uid: int, card_id=None, hp=None) -> dict:
     }
 
 
+def deck_stat_totals(cards, artifacts=None) -> dict:
+    # ⚖️ Рейтинг отряда: сумма всех стат (атака/защита/хиты/скрытность).
+    # artifacts — {card_id: {stat: bonus}} надетых артефактов: их бонусы
+    # входят в сумму (иначе «равный» противник получал бы побои сильнее).
+    t = {"attack": 0, "armor": 0, "hp": 0, "sub": 0}
+    for c in cards:
+        t["attack"] += c["attack"]
+        t["armor"] += c["armor"]
+        t["hp"] += c["hp_max"]
+        t["sub"] += c["sub"]
+        ab = (artifacts or {}).get(c.get("id")) or {}
+        for k in t:
+            t[k] += ab.get(k, 0)
+    return t
+
+
+def stat_diff_model(a: dict, b: dict) -> float:
+    # Суммарная модель разницы всех стат (критерий «равного» противника):
+    # |Δ⚔| + |Δ🛡| + |Δ❤|×0.5 + |Δ🥷|
+    return (abs(a["attack"] - b["attack"]) + abs(a["armor"] - b["armor"])
+            + abs(a["hp"] - b["hp"]) * ART_STAT_WEIGHT["hp"]
+            + abs(a["sub"] - b["sub"]))
+
+
+def make_rated_enemy_deck(player_cards, rarity_key: str, level: int) -> list:
+    # ⚖️ Подбор противника (правка заказчика): колода ТОЙ ЖЕ редкости и
+    # ТОГО ЖЕ размера, что и колода игрока; перегенерируется, пока модель
+    # разницы всех стат не станет ≤ ENEMY_MATCH_DIFF_MAX. Не сошлось за
+    # ENEMY_MATCH_TRIES попыток — берём минимальную разницу.
+    # Рейтинг считается ПО СТАТАМ КАРТ (без артефактов): бонусы артефактов —
+    # преимущество игрока поверх равного боя (иначе противник физически не
+    # мог бы «догнать» отряд с артефактами — генерация не сходится).
+    p = deck_stat_totals(player_cards)
+    n = max(1, len(player_cards))
+    best, best_diff = None, None
+    for _ in range(max(1, ENEMY_MATCH_TRIES)):
+        deck = [generate_card_data(level=level, rarity=rarity_key) for _i in range(n)]
+        diff = stat_diff_model(p, deck_stat_totals(deck))
+        if best_diff is None or diff < best_diff:
+            best, best_diff = deck, diff
+        if diff <= ENEMY_MATCH_DIFF_MAX:
+            break
+    return best
+
+
 def create_battle(cards, layout_key: str, enemy_rarity: str = None,
                   enemy_level: int = None, artifacts: dict = None) -> dict:
     # cards — строки из БД (боевая колода игрока, до MAX_DECK карт).
     # layout_key — ключ выбранной игроком раскладки из LAYOUTS ("31"/"22"/"13").
-    # enemy_rarity — фиксированная редкость колоды противника (для админ-
-    # прогонов «против колоды аналогичной редкости»); None — случайная.
+    # enemy_rarity — фиксированная редкость колоды противника (админ-прогоны
+    # и миссии); None — противник ПОДБИРАЕТСЯ ПО СИЛЕ отряда (см.
+    # make_rated_enemy_deck: та же средняя редкость, модель разницы стат ≤ 5).
     # enemy_level — фиксированный уровень колоды противника (миссии по
-    # добыче осколков); None — средний уровень колоды игрока.
+    # добыче осколков); None — средний уровень колоды игрока. Задание
+    # любого из двух отключает подбор по силе (фиксированная сложность).
     # artifacts — {card_id: {"attack": N, ...}} бонусы надетых артефактов
     # (🗡 фича включается в админ-панели); None — артефактов нет.
     state = {
@@ -1422,13 +1566,34 @@ def create_battle(cards, layout_key: str, enemy_rarity: str = None,
         state["next_uid"] += 1
         state["player"]["deck"].append(u)
 
-    # Колода противника: MAX_DECK случайных карт уровня, равного среднему
-    # уровню колоды игрока — чтобы бои не были ни проходными, ни безнадёжными.
-    # (В миссиях уровень задаётся явно: enemy_level = средний + сложность.)
+    # Колода противника.
+    #  ⚖️ ОБЫЧНЫЙ БОЙ (enemy_rarity и enemy_level не заданы): противник
+    #     ПОДБИРАЕТСЯ ПО СИЛЕ ОТРЯДА — карты той же СРЕДНЕЙ редкости, что
+    #     и колода игрока, в том же количестве; перегенерация, пока
+    #     суммарная модель разницы всех стат ≤ ENEMY_MATCH_DIFF_MAX (5).
+    #     Рейтинг считается ПО СТАТАМ КАРТ (без артефактов): бонусы
+    #     артефактов — преимущество игрока поверх равного боя (с ними
+    #     генерация противника физически не сходится — не хватает
+    #     достижимого диапазона сумм).
+    #  ⛏ Миссии / админ-прогон: фиксированная сложность (редкость и/или
+    #     уровень заданы явно) — подбор не используется, размер MAX_DECK.
     avg_level = max(1, round(sum(c["level"] for c in cards) / len(cards)))
     foe_level = max(1, enemy_level or avg_level)
-    for _ in range(MAX_DECK):
-        d = generate_card_data(level=foe_level, rarity=enemy_rarity)
+    if enemy_rarity is None and enemy_level is None:
+        ranks = [rarity_rank((c.get("rarity") if hasattr(c, "get")
+                              else c["rarity"]) or "common") for c in cards]
+        foe_rarity = RARITY_KEYS[max(0, min(len(RARITY_KEYS) - 1,
+                                            round(sum(ranks) / len(ranks))))]
+        foe_deck = make_rated_enemy_deck(cards, foe_rarity, avg_level)
+        state["match_info"] = {
+            "rarity": foe_rarity,
+            "diff": round(stat_diff_model(deck_stat_totals(cards),
+                                          deck_stat_totals(foe_deck)), 1),
+        }
+    else:
+        foe_deck = [generate_card_data(level=foe_level, rarity=enemy_rarity)
+                    for _ in range(MAX_DECK)]
+    for d in foe_deck:
         u = make_unit(d, "enemy", state["next_uid"])
         state["next_uid"] += 1
         state["enemy"]["deck"].append(u)
@@ -2436,11 +2601,11 @@ def spellbook_screen(rk: str, page: int):
     label = "🧾 Все" if rk == "all" else rarity_label(rk)
     head += f"\n{label}: {len(sids)} заклинаний · стр. {page + 1}/{n_pages}\n\n"
     text = head + "\n\n".join(spell_line(sid) for sid in chunk)
-    # 🟧 heroic не выводится вкладкой: своих заклинаний у героической
-    # редкости нет — герой просто открывает всю магию до легендарной.
+    # 🟧 heroic и 🔴 arcana не выводятся вкладками: своих заклинаний у этих
+    # редкостей нет — их rank (5/6) открывает всю магию до легендарной.
     rows = [[ib("🧾", "spb:all:0")] +
             [ib(rarity_label(k).split(" ")[0], f"spb:{k}:0")
-             for k in RARITY_KEYS if k != "heroic"]]
+             for k in RARITY_KEYS if k not in ("heroic", "arcana")]]
     nav = []
     if page > 0:
         nav.append(ib("◀️", f"spb:{rk}:{page - 1}"))
@@ -3466,7 +3631,7 @@ HELP_TEXT = f"""❓ <b>«Карточные бои» — коротко о гл�
 
 🃏 <b>Карты</b>
 • Два класса: <b>Воин ⚔️</b> (ближний бой; пары стат: Атака↔Защита, Здоровье↔Скрытность) и <b>Заклинатель 🔮</b> (магия за манну; пары: Атака↔Запас Манны, Здоровье↔Точность). Система весов: +20% к одной стате пары → −10% к парной.
-• Редкости: ⬜ 50% · 🟩 27% · 🟦 15% · 🟪 6% · 🟨 2% — множитель статов ×1.00–×1.20; чем выше редкость, тем сильнее доступная магия. 🟧 Героическая — только ваш личный герой (из «🎲» не выпадает). Гарант (pity) настраивается PITY_CONFIG (сейчас выключен).
+• Редкости: ⬜ 50% · 🟩 27% · 🟦 15% · 🟪 6% · 🟨 2% — множитель статов ×1.00–×1.20; чем выше редкость, тем сильнее доступная магия. 🟧 Героическая — только ваш личный герой (из «🎲» не выпадает). 🔴 Аркановая — экспериментальная редкость (бонусы статов как у легендарной ×1.20 + принадлежность сету со связками-аурами); включается админом. Гарант (pity) настраивается PITY_CONFIG (сейчас выключен).
 • 📜 Титул: с 3-го уровня карточке можно даровать титул; переключатель 🎭 ставит его перед именем («Гроза Юга» Пупкин).
 • 10 рас, имена не повторяются внутри коллекции (двойникам добавляется «II», «III»…).
 
@@ -3477,6 +3642,7 @@ HELP_TEXT = f"""❓ <b>«Карточные бои» — коротко о гл�
 • Имя герою можно задать сразу после создания и менять в любой момент: карточка героя → «✏️ Переименовать».
 
 ⚔️ <b>Бой</b>
+• ⚖️ Противник подбирается ПО СИЛЕ ОТРЯДА: сила = сумма всех стат колоды (отдельно ⚔ атака, 🛡 защита, ❤ хиты, 🥷 скрытность). Колода врага — карты вашей средней редкости в том же количестве, генерируются заново, пока суммарная модель разницы всех стат не станет ≤ 5 (|Δ⚔|+|Δ🛡|+|Δ❤|×0,5+|Δ🥷|). Бонусы артефактов в рейтинг НЕ входят — это ваше преимущество поверх равного боя. В миссиях сложность фиксированная.
 • Поле: 4 линии сверху вниз — В2 (тыл врага), В1 (фронт врага), С1 (ваш фронт), С2 (ваш тыл); у каждой стороны 4 клетки. Раскладки: 3+1, 2+2, 1+3. Ваша клетка 1 стоит напротив вражеской 3.
 • За ход — ОДНО действие: ДП юнита (⚔️ атака, 🗡 скрытая, 🚶 перемещение на пустую клетку своей/соседней линии, 🔰 защита, ↩️ отход в колоду, ✨ магия) ИЛИ 📥 высадка карты из колоды.
 • Всё управление — клики по клеткам: враг → кем бить; свой юнит → меню действий; пустая клетка → переместиться/высадить.
@@ -3503,7 +3669,7 @@ HELP_TEXT = f"""❓ <b>«Карточные бои» — коротко о гл�
 • «👤 Профиль» — ник и статистика боёв. «📖 Книга заклинаний» — справочник всей магии (40 заклинаний); «✨ Магия» внизу карты боя — каст прямо с поля.
 • 📚 Коллекция: фильтры (класс/колода/редкость/раса/🌟), сортировка по 13 критериям, пагинация.
 • Обозначения: 👹 враг · 🔰 защита · 💤 истощён · ❄️ заморозка · ⏳ петля времени · 🧱 стена (+3 КЗ тылу, заслон) · 🟢 болото (−25% атаки, −2 КЗ) · ⬜ пусто · ▫️ клетки нет.
-• 🗡 Артефакты и 🌀 Арканы — экспериментальные разделы: включаются админом индивидуально; когда включены, их правила появляются в конце этой справки и в профиле."""
+• 🗡 Артефакты и 🔴 Арканы — экспериментальные разделы: включаются админом индивидуально; когда включены, их правила появляются в конце этой справки и в профиле."""
 
 
 # ---------------------------------------------------------------------
@@ -3559,12 +3725,17 @@ HELP_PAGES = pack_pages(HELP_TEXT)
 # users.feat_arcana). План реализации — Optim1=Help;Hero;TimeOut.md.
 # ---------------------------------------------------------------------
 
-ARTIFACTS_HELP_TEXT = """🗡 <b>Артефакты и миссии (экспериментальная фича)</b>
+ARTIFACTS_HELP_TEXT = f"""🗡 <b>Артефакты и миссии (экспериментальная фича)</b>
 
 📿 <b>Что это</b>
 • Артефакт — предмет, который надевается на карту и увеличивает её статы В БОЮ: ⚔️ атака, 🛡 защита, ❤ здоровье или 🥷 скрытность/🎯 точность.
 • На карте может быть надет ОДИН артефакт; у артефакта — одна карта. Бонусы не «впекаются» в карту навсегда: сняли артефакт — статы прежние.
-• Артефакты качаются ОТДЕЛЬНО от карт за 💎 осколки: каждый уровень усиливает бонус (потолок — L10). Чем выше редкость артефакта, тем выше базовый бонус.
+• Артефакты качаются ОТДЕЛЬНО от карт за 💎 осколки: 10 уровней, и каждый раскрывает часть ПОТОЛКА СИЛЫ артефакта.
+
+💪 <b>Сила и поинты</b>
+• У каждой редкости свой потолок силы в ПОИНТАХ: ⬜10 · 🟩15 · 🟦20 · 🟪25 · 🟨30. Прокачка L1→L10 растянута от стартового бонуса (33% потолка) до максимума (100%).
+• Поинты переводятся в стату по весам: 1 поинт = 1 ⚔️ = 2 ❤ = 0,6 🛡 = ~0,8 🥷 (защита и скрытность ценнее — их бонус меньше в единицах, но сильнее в бою).
+• ⚖️ Лимит силы отряда: суммарно на боевую колоду — не больше {ART_DECK_POWER_LIMIT or '∞'} поинтов (надеть сверх бюджета не получится; в бою излишки не действуют). Две «легендарки» L10 или горсть ⬜ — выбирайте.
 
 💎 <b>Осколки и миссии</b>
 • Осколки добываются в МИССИЯХ: «👤 Профиль» → «🗡 Артефакты» → «⛏ Миссия по добыче». Отряд (ваша боевая колода) уходит на вылазку — это обычный бой с ботом повышенной сложности; расстановку (сколько клеток фронта и тыла: 3+1, 2+2 или 1+3) вы выбираете сами, как перед обычным боем.
@@ -3572,20 +3743,22 @@ ARTIFACTS_HELP_TEXT = """🗡 <b>Артефакты и миссии (экспе�
 • Между миссиями действует кулдаун MISSION_COOLDOWN_MIN (в минутах).
 
 🛠 <b>Как пользоваться</b>
-• «🧿 Создать» — за 30💎 выберите стату (⚔️/🛡/❤️/🥷) — получите артефакт случайной редкости.
+• «🧿 Создать» — за 30💎 выберите стату (⚔️/🛡/❤️/🥷) — получите артефакт случайной редкости (редкость = потолок силы, редкие в среднем растут выше).
 • Клик по артефакту — «⬆️ Улучшить» (10💎 × уровень), «🃏 Надеть» (выбор карты), «♻️ Снять».
-• Надетые артефакты действуют в обычных боях, в миссиях и в админ-прогоне."""
+• Надетые артефакты действуют в обычных боях, в миссиях и в админ-прогоне. В рейтинг силы отряда при подборе противника они НЕ входят — противник подбирается по статям карт, а артефакты остаются вашим преимуществом поверх равного боя (стак ограничивает лимит силы отряда)."""
 
-ARCANA_HELP_TEXT = """🌀 <b>Аркановые персонажи (экспериментальная фича)</b>
+ARCANA_HELP_TEXT = """🔴 <b>Аркановые персонажи (экспериментальная фича)</b>
 
-• Аркановые персонажи ОЧЕНЬ редкие: при включённой фиче каждая НОВАЯ карта («🎲 Получить карту») с шансом ARCANA_CHANCE_PCT% принадлежит одному из трёх сетов: 🔥 Пламя, 🪨 Камень, 🌿 Жизнь (значок сета виден в коллекции и на поле).
+• АРКАНА — это РЕДКОСТЬ: обозначается красным 🔴, бонусы статов — КАК У ЛЕГЕНДАРНОЙ карты (×1,20), вся легендарная магия доступна.
+• Аркановые карты ОЧЕНЬ редкие: при включённой фиче каждая НОВАЯ карта («🎲 Получить карту») с шансом ARCANA_CHANCE_PCT% становится 🔴 аркановой (реже легендарной — 2%).
+• Каждая аркановая карта принадлежит одному из трёх СЕТОВ: 🔥 Пламя, 🪨 Камень, 🌿 Жизнь (значок сета виден в коллекции и на поле).
 • Связка: когда на ПОЛЕ БОЯ одновременно стоит 2+ карты одного сета, каждая получает постоянную ауру, пока связка жива:
   🔥 Пламя — +2 к Атаке;
   🪨 Камень — +2 к Защите (КЗ);
   🌿 Жизнь — лечит 2 HP в начале своего хода.
 • Если союзник из связки погибает или уходит с поля — аура спадает (и возвращается, когда связка снова собрана).
 • В списке юнитов и на клетках поля значок сета с «✦» означает: аура сейчас активна.
-• Аркановые карты работают как обычные: их так же можно качать, надевать на них артефакты и собирать из них колоды-связки."""
+• В остальном аркановые карты работают как обычные: их так же можно качать, надевать на них артефакты и собирать из них колоды-связки."""
 
 ARTIFACTS_HELP_PAGES = pack_pages(ARTIFACTS_HELP_TEXT)
 ARCANA_HELP_PAGES = pack_pages(ARCANA_HELP_TEXT)
@@ -3782,7 +3955,7 @@ async def profile_screen(user_id: int):
             f"🃏 Карт в коллекции: {len(cards)}\n")
     if fl.get("feat_arcana"):
         arc_n = sum(1 for c in cards if (c.get("arcana") or "") in ARCANA_SETS)
-        text += f"🌀 Аркановых карт: {arc_n}\n"
+        text += f"🔴 Аркановых карт: {arc_n}\n"
     text += ("\n⚔️ <b>Статистика боёв</b>\n"
              f"🏆 Побед: {p.get('wins') or 0}\n"
              f"🤝 Ничьих: {p.get('draws') or 0}\n"
@@ -5042,12 +5215,14 @@ async def get_new_card(user_id: int):
         while await db_name_taken(user_id, d["name"], f"{d['surname']} {roman_numeral(n)}"):
             n += 1
         d["surname"] = f"{d['surname']} {roman_numeral(n)}"
-    # 🌀 АРКАНА (фича включается в админ-панели индивидуально): с шансом
-    # ARCANA_CHANCE_PCT% новая карта становится аркановой — принадлежит
-    # случайному сету и даёт ауру связке на поле боя.
+    # 🔴 АРКАНА (фича включается в админ-панели индивидуально): с шансом
+    # ARCANA_CHANCE_PCT% новая карта становится АРКАНОВОЙ — это РЕДКОСТЬ
+    # (бонусы статов как у легендарной, ×1.20) + принадлежность одному из
+    # сетов (🔥/🪨/🌿 — связки на поле дают ауры).
     arc_hit = None
     if ARCANA_CHANCE_PCT > 0 and await user_flag(user_id, "feat_arcana"):
         if random.randint(1, 100) <= ARCANA_CHANCE_PCT:
+            d["rarity"] = "arcana"
             d["arcana"] = random.choice(ARCANA_KEYS)
             arc_hit = ARCANA_SETS[d["arcana"]]
     cid = await db_add_card(user_id, d)
@@ -5057,7 +5232,8 @@ async def get_new_card(user_id: int):
         await set_user_flag(user_id, "pity", pity)
     row = await db_get_card(cid, user_id)
     if arc_hit:
-        fanf = (f"🌀✨ <b>АРКАНОВАЯ КАРТА!</b> ✨🌀\nСет «{arc_hit['name']}» "
+        fanf = (f"🔴✨ <b>АРКАНОВАЯ КАРТА!</b> ✨🔴\nРедкость 🔴 Аркановая — статы "
+                f"как у легендарной (×1.20).\nСет «{arc_hit['name']}» "
                 f"{arc_hit['emoji']}: {arc_hit['desc']}\n\n")
     elif d["rarity"] == "legendary":
         fanf = "🎉🟨 <b>ЛЕГЕНДАРНАЯ КАРТА!</b> 🟨🎉\n\n"
@@ -5138,8 +5314,23 @@ async def battle_setup_screen(user_id: int, deck: int = 0, force_pick: bool = Fa
     battle_cards = cards[:MAX_DECK]
     note = (f"\n⚠️ В колоде больше {MAX_DECK} карт — в бой пойдут первые {MAX_DECK}."
             if len(cards) > MAX_DECK else "")
+    # ⚖️ Рейтинг отряда — сумма всех стат карт (по нему подбирается
+    # противник); артефакты показываем отдельной строкой как бонус силы.
+    arts = None
+    if await user_flag(user_id, "feat_artifacts"):
+        arts, _sk = apply_artifact_budget(
+            battle_cards, await equipped_artifact_bonuses(user_id))
+    t = deck_stat_totals(battle_cards)
+    art_line = ""
+    if arts:
+        art_line = (f" · 🗡 артефакты +{sum(bonuses_power(a) for a in arts.values()):g} п. "
+                    f"(лимит {ART_DECK_POWER_LIMIT or '∞'})")
+    rating = (f"\n⚖️ <b>Сила отряда</b>: ⚔{t['attack']} · 🛡{t['armor']} · "
+              f"❤{t['hp']} · 🥷{t['sub']}{art_line}\n"
+              f"<i>Противник подбирается по силе: карты вашей средней редкости, "
+              f"пока суммарная разница стат не станет ≤ {ENEMY_MATCH_DIFF_MAX}.</i>\n")
     text = (f"⚔️ <b>Подготовка к бою</b> · колода №{deck}\n\n"
-            f"Карт в бою: {len(battle_cards)}.{note}\n\n"
+            f"Карт в бою: {len(battle_cards)}.{note}{rating}\n"
             "Выберите расстановку (<b>всего 4 клетки</b>, максимум 3 на линию, обе линии обязательны):\n"
             "• <b>3 фронта / 1 тыл</b> — фронт 1,2,3; тыл 2\n"
             "• <b>2 фронта / 2 тыла</b> — обе линии: 1 и 3\n"
@@ -5189,13 +5380,19 @@ async def cb_battle_start(call: CallbackQuery):
         await safe_answer(call, "Колода пуста! Добавьте карты: «🃏 Колода».", show_alert=True)
         return
     # 🗡 Артефакты (фича включается в админ-панели): бонусы надетых
-    # артефактов вливаются в боевые статы отряда.
-    artifacts = None
+    # артефактов вливаются в боевые статы отряда — в пределах ЛИМИТА
+    # СИЛЫ ОТРЯДА (ART_DECK_POWER_LIMIT поинтов; излишки не действуют).
+    artifacts, skipped = None, []
     if await user_flag(user_id, "feat_artifacts"):
-        artifacts = await equipped_artifact_bonuses(user_id)
+        artifacts, skipped = apply_artifact_budget(
+            cards, await equipped_artifact_bonuses(user_id))
     state = create_battle(cards, layout_key, artifacts=artifacts)
     log_add(state, f"⚔️ Бой начался (колода №{deck})! Нажмите на клетку поля, "
                    "чтобы действовать. Удачи!")
+    if skipped:
+        names = ", ".join(c["name"] for c in cards if c["id"] in skipped)
+        log_add(state, f"🗡 Лимит силы отряда ({ART_DECK_POWER_LIMIT:g} п.): "
+                       f"артефакты не вошли в бой — {names}.")
     await db_save_battle(user_id, state)
     if BATTLE_TIMEOUT_MIN > 0:
         await db_stamp(user_id, "last_battle_at")   # ⏳ отсчёт кулдауна
@@ -6268,8 +6465,8 @@ async def _art_ok(call: CallbackQuery) -> bool:
 
 
 def artifact_line(a, cards=None) -> str:
-    # Артефакт в одну строку (список/детали)
-    stat = a["stat"] if a.get("stat") in ART_BASE else "attack"
+    # Артефакт в одну строку (список/детали): бонус к стате + сила в поинтах
+    stat = a["stat"] if a.get("stat") in ART_STAT_WEIGHT else "attack"
     ico = ART_STAT_ICON.get(stat, "•")
     rem = rarity_label(a.get("rarity") or "common").split(" ")[0]
     eq = ""
@@ -6278,7 +6475,8 @@ def artifact_line(a, cards=None) -> str:
         c = next((x for x in cards if x["id"] == cid), None)
         if c:
             eq = f" → {disp_name(c)}"
-    return f"{ico} {a['name']} {rem} L{a.get('level') or 1} (+{art_bonus_of(a)}){eq}"
+    return (f"{ico} {a['name']} {rem} L{a.get('level') or 1} "
+            f"(+{art_bonus_of(a)} · {artifact_power(a):g}п){eq}")
 
 
 async def artifacts_screen(user_id: int, page: int = 0):
@@ -6332,13 +6530,18 @@ async def cb_art_craft_menu(call: CallbackQuery):
         return
     fl = await db_get_flags(call.from_user.id)
     shards = fl.get("shards") or 0
-    rows = [[ib(f"{ART_STAT_ICON[s]} {ART_SLOTS[s]} — база +{ART_BASE[s]}",
-                f"artcraft:{s}")] for s in ART_BASE]
+    rows = []
+    for s in ART_SLOTS:
+        lo = art_bonus_of({"stat": s, "rarity": "common", "level": 1})
+        hi = art_bonus_of({"stat": s, "rarity": "legendary", "level": ART_MAX_LEVEL})
+        rows.append([ib(f"{ART_SLOTS[s]} — от +{lo} до +{hi}", f"artcraft:{s}")])
     rows.append([ib("⬅️ Назад", "art:0")])
     await safe_answer(call)
     await safe_edit(call, f"🧿 <b>Создание артефакта</b> · стоимость: {ART_CRAFT_COST}💎 "
-                          f"(у вас 💎{shards})\n\nРедкость будет случайной — она "
-                          "добавляет +0…+4 к бонусу. Выберите стату:",
+                          f"(у вас 💎{shards})\n\nРедкость будет случайной — она задаёт "
+                          "<b>потолок силы</b> (в поинтах): ⬜10 · 🟩15 · 🟦20 · 🟪25 · "
+                          "🟨30. Прокачка L1→L10 раскрывает его: 33% → 100%. "
+                          "Чем реже артефакт, тем сильнее вырастет. Выберите стату:",
                     InlineKeyboardMarkup(inline_keyboard=rows))
 
 
@@ -6348,7 +6551,7 @@ async def cb_art_craft_do(call: CallbackQuery):
         return
     stat = call.data.split(":")[1]
     uid = call.from_user.id
-    if stat not in ART_BASE:
+    if stat not in ART_STAT_WEIGHT:
         await safe_answer(call, "Неизвестная стата.", show_alert=True)
         return
     fl = await db_get_flags(uid)
@@ -6387,22 +6590,31 @@ async def cb_artifact_details(call: CallbackQuery):
         await safe_answer(call, "Артефакт не найден.", show_alert=True)
         return
     cards = await db_user_cards(uid)
-    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
+    stat = row["stat"] if row.get("stat") in ART_STAT_WEIGHT else "attack"
     lvl = max(1, int(row.get("level") or 1))
-    rank = rarity_rank(row.get("rarity") or "common")
+    rar = row.get("rarity") or "common"
+    cap = ART_POWER_CAP.get(rar, 10)
     bonus = art_bonus_of(row)
+    power = artifact_power(row)
     cid = row.get("equipped_card") or 0
     eq_c = next((c for c in cards if c["id"] == cid), None) if cid else None
     eq = f"🃏 Надет на: <b>{disp_name(eq_c)}</b>" if eq_c else "🃏 Не надет"
-    up_line = (f"⬆️ Следующий уровень: {art_up_cost(lvl)}💎 → +{ART_PER_LVL[stat]} к бонусу"
-               if lvl < ART_MAX_LEVEL else "⭐ Максимальный уровень")
+    pct = int(round(ART_POWER_LEVELS[lvl - 1] * 100))
+    if lvl < ART_MAX_LEVEL:
+        nxt = art_bonus_of({**row, "level": lvl + 1})
+        up_line = f"⬆️ Следующий уровень: {art_up_cost(lvl)}💎 → бонус +{nxt}"
+    else:
+        up_line = "⭐ Максимальный уровень — потолок силы раскрыт"
     text = (f"🗡 <b>{row['name']}</b> · #{row['id']}\n"
-            f"{rarity_label(row.get('rarity') or 'common')} · {ART_SLOTS.get(stat, stat)}\n\n"
-            f"{ART_STAT_ICON[stat]} Бонус в бою: <b>+{bonus}</b> "
-            f"(база {ART_BASE[stat]} + редкость {rank} + уровни {(lvl - 1) * ART_PER_LVL[stat]})\n"
+            f"{rarity_label(rar)} · {ART_SLOTS.get(stat, stat)}\n\n"
+            f"{ART_STAT_ICON[stat]} Бонус в бою: <b>+{bonus}</b> к стате\n"
+            f"💪 Сила: <b>{power:g}/{cap}</b> поинтов ({pct}% потолка — "
+            f"{lvl}-й уровень)\n"
             f"⭐ Уровень: {lvl}/{ART_MAX_LEVEL} · {up_line}\n{eq}\n\n"
-            "<i>Бонус действует только в бою и не меняется в самой карте — "
-            "снять артефакт можно в любой момент.</i>")
+            f"<i>Потолок силы задаёт редкость (🟨 макс.). Бонус действует "
+            f"только в бою и не въедается в карту — снять можно в любой "
+            f"момент. Сила отряда ограничена: {ART_DECK_POWER_LIMIT or '∞'} "
+            f"поинтов на колоду.</i>")
     rows = []
     if lvl < ART_MAX_LEVEL:
         rows.append([ib(f"⬆️ Улучшить ({art_up_cost(lvl)}💎)", f"artu:{aid}:{page}")])
@@ -6442,7 +6654,7 @@ async def cb_artifact_upgrade(call: CallbackQuery):
     await db_patch_artifact(aid, uid, {"level": lvl + 1})
     row = await db_get_artifact(aid, uid)
     await safe_answer(call, f"⬆️ Уровень {lvl + 1}!")
-    stat = row["stat"] if row.get("stat") in ART_BASE else "attack"
+    stat = row["stat"] if row.get("stat") in ART_STAT_WEIGHT else "attack"
     await safe_edit(call, f"⬆️ <b>{row['name']}</b> улучшен до L{lvl + 1} — "
                           f"бонус теперь {ART_STAT_ICON[stat]}+{art_bonus_of(row)}.\n"
                           f"💎 Осколков: {(fl.get('shards') or 0) - cost}",
@@ -6500,6 +6712,27 @@ async def cb_artifact_equip(call: CallbackQuery):
     if not row or not card:
         await safe_answer(call, "Артефакт или карта не найдены.", show_alert=True)
         return
+    # ⚖️ Лимит силы отряда (ART_DECK_POWER_LIMIT, поинты): проверяем все
+    # колоды, где карта входит в боевой состав (первые MAX_DECK). Старый
+    # артефакт карты в расчёт не берётся — его слот освобождается.
+    if ART_DECK_POWER_LIMIT > 0:
+        all_cards = await db_user_cards(uid)
+        arts = await db_user_artifacts(uid)
+        pow_of = {int(a["equipped_card"]): artifact_power(a)
+                  for a in arts if a.get("equipped_card") and a["id"] != row["id"]}
+        for n, dcards in decks_of(all_cards).items():
+            battle = dcards[:MAX_DECK]
+            if not any(c["id"] == card["id"] for c in battle):
+                continue
+            total = sum(pow_of.get(int(c["id"]), 0.0) for c in battle
+                        if c["id"] != card["id"])
+            if total + artifact_power(row) > ART_DECK_POWER_LIMIT + 1e-9:
+                await safe_answer(
+                    call, f"⚖️ Превышен лимит силы отряда ({ART_DECK_POWER_LIMIT:g} п.): "
+                          f"колода №{n} уже несёт {total:g} п., артефакт добавляет "
+                          f"{artifact_power(row):g} п. Снимите что-нибудь или "
+                          f"улучшайте менее «тяжёлые» артефакты.", show_alert=True)
+                return
     # На карте может быть только ОДИН артефакт — освобождаем слот
     await db_unequip_card(uid, int(cid))
     await db_patch_artifact(int(aid), uid, {"equipped_card": int(cid)})
@@ -6645,7 +6878,8 @@ async def cb_mission_run(call: CallbackQuery):
     if err:
         await safe_answer(call, err, show_alert=True)
         return
-    artifacts = await equipped_artifact_bonuses(uid)
+    artifacts, skipped = apply_artifact_budget(
+        cards, await equipped_artifact_bonuses(uid))
     avg_level = max(1, round(sum(c["level"] for c in cards) / len(cards)))
     state = create_battle(cards, layout_key,
                           enemy_rarity=m["rar"], enemy_level=avg_level + m["dlvl"],
@@ -6653,6 +6887,10 @@ async def cb_mission_run(call: CallbackQuery):
     state["mission"] = {"key": m["key"], "label": m["label"], "shards": m["shards"]}
     log_add(state, f"⛏ Миссия «{m['label']}» началась! Победа принесёт "
                    f"💎{m['shards']} осколков. Удачи!")
+    if skipped:
+        names = ", ".join(c["name"] for c in cards if c["id"] in skipped)
+        log_add(state, f"🗡 Лимит силы отряда ({ART_DECK_POWER_LIMIT:g} п.): "
+                       f"артефакты не вошли в бой — {names}.")
     await db_save_battle(uid, state)
     if MISSION_COOLDOWN_MIN > 0:
         await db_stamp(uid, "last_mission_at")   # кулдаун — от старта вылазки
@@ -6683,7 +6921,7 @@ def admin_text() -> str:
             "❤️ Вылечить все карты\n"
             f"⚔️ Прогон боёв — N боёв (N &lt; 50) вашей колодой против колоды "
             f"аналогичной редкости; полный лог ходов придёт файлом.\n"
-            "🧪 Фичи — экспериментальные разделы (🗡 Артефакты, 🌀 Арканы): "
+            "🧪 Фичи — экспериментальные разделы (🗡 Артефакты, 🔴 Арканы): "
             "включаются только здесь и ИНДИВИДУАЛЬНО каждому игроку.")
 
 
@@ -6701,7 +6939,7 @@ def admin_kb() -> InlineKeyboardMarkup:
 # ---------- 🧪 экспериментальные фичи: индивидуальное включение ----------
 
 FEAT_COLS = {"art": ("feat_artifacts", "🗡 Артефакты и миссии"),
-             "arc": ("feat_arcana", "🌀 Аркановые персонажи")}
+             "arc": ("feat_arcana", "🔴 Аркановые персонажи")}
 
 
 async def feat_screen(target_uid: int):
@@ -6716,8 +6954,9 @@ async def feat_screen(target_uid: int):
                         f"admf:{target_uid}:{key}")])
     lines += ["", "🗡 Артефакты: у игрока в «👤 Профиль» появляется раздел "
                  "артефактов и миссии по добыче 💎.",
-              "🌀 Арканы: новые карты игрока с шансом ARCANA_CHANCE_PCT% "
-              "становятся аркановыми (связки на поле дают ауры)."]
+              "🔴 Арканы: новые карты игрока с шансом ARCANA_CHANCE_PCT% "
+              "становятся АРКАНОВОЙ редкости (статы как у легендарной) и "
+              "принадлежат сету — связки на поле дают ауры."]
     rows.append([ib("⬅️ Админ-панель", "adm:root")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -6766,10 +7005,11 @@ async def run_battle_sims(user_id: int, n: int):
     if not bcards:
         return None, None
     # 🗡 Если игроку включены артефакты — прогон учитывает надетые
-    # (симуляция должна совпадать с реальным боем).
+    # (в пределах лимита силы отряда — симуляция совпадает с реальным боем).
     artifacts = None
     if await user_flag(user_id, "feat_artifacts"):
-        artifacts = await equipped_artifact_bonuses(user_id)
+        artifacts, _skipped = apply_artifact_budget(
+            bcards, await equipped_artifact_bonuses(user_id))
     n = max(1, min(n, SIM_MAX_BATTLES))
     ranks = [rarity_rank(c["rarity"] if "rarity" in c.keys() else "common") for c in bcards]
     enemy_rarity = RARITY_KEYS[max(0, min(4, round(sum(ranks) / len(ranks))))]
